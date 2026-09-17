@@ -1095,17 +1095,15 @@ bool build_vpkuhum(BuilderContext& ctx) {
 
 bool build_vpkuhus(BuilderContext& ctx) {
   // Vector Pack Unsigned Halfword Unsigned Saturate
-  // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
-  // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
-  // instead of 0xFF.
-  for (size_t i = 0; i < 8; i++) {
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
-                ctx.v(ctx.insn.operands[1]), 7 - i);
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
-                ctx.v(ctx.insn.operands[2]), 7 - i);
-  }
+  // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so clamp each unsigned halfword to
+  // 0xFF first (unsigned halfwords >= 0x8000 would otherwise be interpreted as negative and
+  // clamped to 0 instead of 0xFF). Done in SIMD so that vD aliasing vA or vB is safe.
+  ctx.println(
+      "	simde_mm_store_si128((simde__m128i*){}.u8, "
+      "simde_mm_packus_epi16(simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), "
+      "simde_mm_set1_epi16(0xFF)), simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), "
+      "simde_mm_set1_epi16(0xFF))));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[2]), ctx.v(ctx.insn.operands[1]));
   return true;
 }
 
@@ -1123,17 +1121,15 @@ bool build_vpkuwum(BuilderContext& ctx) {
 
 bool build_vpkuwus(BuilderContext& ctx) {
   // Vector Pack Unsigned Word Unsigned Saturate
-
-  // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
-  // Saturate each u32 to [0, 0xFFFF], then pack to u16
-  for (size_t i = 0; i < 4; i++) {
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
-                ctx.v(ctx.insn.operands[1]), 3 - i);
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
-                ctx.v(ctx.insn.operands[2]), 3 - i);
-  }
+  // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so clamp each unsigned word to 0xFFFF
+  // first. Done in SIMD so that vD aliasing vA or vB is safe (a per-lane scalar loop clobbered
+  // the source's lanes 2-3 before they were read).
+  ctx.println(
+      "	simde_mm_store_si128((simde__m128i*){}.u16, "
+      "simde_mm_packus_epi32(simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), "
+      "simde_mm_set1_epi32(0xFFFF)), simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), "
+      "simde_mm_set1_epi32(0xFFFF))));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[2]), ctx.v(ctx.insn.operands[1]));
   return true;
 }
 
