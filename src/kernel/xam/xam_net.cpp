@@ -365,20 +365,28 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
     return ~0u;
   }
 
-  uint64_t timeout_wait = (uint64_t)timeout;
+  // Kernel wait type: 0 = wait all, 1 = wait any. The timeout is a
+  // relative NT interval (negative, 100 ns units).
+  const uint32_t wait_type = wait_all ? 0 : 1;
+  uint64_t timeout_wait = static_cast<uint64_t>(-static_cast<int64_t>(timeout) * 10000);
 
   X_STATUS result = 0;
   do {
-    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
+    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_type, 1, alertable,
                                                     timeout != -1 ? &timeout_wait : nullptr);
   } while (result == X_STATUS_ALERTED);
 
+  if (result == X_STATUS_TIMEOUT) {
+    XThread::SetLastError(258);  // WSA_WAIT_TIMEOUT
+    return 258;
+  }
   if (XFAILED(result)) {
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
     return ~0u;
   }
-  return 0;
+  // WSA_WAIT_EVENT_0 + index of the signalled event (0 for a wait-all).
+  return result < num_events ? result : 0;
 }
 
 u32 NetDll_WSACreateEvent_entry() {
