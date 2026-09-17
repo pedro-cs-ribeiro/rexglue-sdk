@@ -19,6 +19,7 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
+#include <rex/input/script/script_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
@@ -26,6 +27,9 @@
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
+REXCVAR_DEFINE_STRING(input_script, "", "Input",
+                      "Path to a controller script replayed as a synthetic gamepad on user 0 "
+                      "(lines: <seconds> <buttons_hex> [lx ly rx ry lt rt]); automation aid");
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 namespace rex::input {
@@ -338,6 +342,16 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::move(sdl_driver));
+      }
+    }
+
+    // Scripted controller (automation aid), before the keyboard driver so it
+    // is the first synthetic device on user 0.
+    if (!REXCVAR_GET(input_script).empty()) {
+      auto script_driver =
+          std::make_unique<script::ScriptInputDriver>(nullptr, 0, REXCVAR_GET(input_script));
+      if (script_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(script_driver));
       }
     }
 

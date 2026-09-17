@@ -7,6 +7,7 @@ add_library(rexinput OBJECT
     state_merge.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
+    script/script_input_driver.cpp
 )
 add_library(rex::input ALIAS rexinput)
 
