@@ -33,6 +33,9 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_BOOL(profiler, false, "Runtime",
+                    "Start the Tracy profiler client at setup (port 8086) in profiling builds")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 
@@ -94,6 +97,12 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     return X_STATUS_UNSUCCESSFUL;
   }
   instance_ = this;
+
+  // The Tracy client is built with delayed initialisation, so nothing runs
+  // until something starts it; do that here when asked.
+  if (REXCVAR_GET(profiler)) {
+    rex::perf::Profiler::Startup();
+  }
 
   auto fail = [this](X_STATUS status, std::string_view reason) {
     REXSYS_ERROR("Runtime::Setup failed: {}", reason);
