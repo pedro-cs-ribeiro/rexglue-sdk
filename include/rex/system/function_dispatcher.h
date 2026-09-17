@@ -29,6 +29,8 @@
 #include <rex/system/thread_state.h>
 #include <rex/thread/mutex.h>
 
+struct PPCContext;
+
 namespace rex::runtime {
 
 // Forward declarations
@@ -49,6 +51,9 @@ class IModuleRegistrar {
  protected:
   ~IModuleRegistrar() = default;
 };
+
+// Guest call chain (" LR LR ...") for diagnostics; safe on a corrupt stack.
+std::string GuestBacktrace(const PPCContext& ctx, const uint8_t* base);
 
 class FunctionDispatcher : public IModuleRegistrar {
  public:

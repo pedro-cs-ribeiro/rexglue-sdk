@@ -35,11 +35,11 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
-  // Walk the guest back chain so the log names the call site and its callers:
-  // each frame stores the previous r1 at 0(r1) and the caller's LR at -8 of
-  // that previous frame (mflr r12; stw r12,-8(r1); stwu r1,-N(r1)). Every
-  // load is guarded with QueryProtect so a corrupt chain cannot fault here.
+// Walks the guest back chain so a log can name the call site and its callers:
+// each frame stores the previous r1 at 0(r1) and the caller's LR at -8 of
+// that previous frame (mflr r12; stw r12,-8(r1); stwu r1,-N(r1)). Every
+// load is guarded with QueryProtect so a corrupt chain cannot fault here.
+std::string GuestBacktrace(const PPCContext& ctx, const uint8_t* base) {
   std::string chain;
   Runtime* runtime = Runtime::instance();
   auto* memory = runtime ? runtime->memory() : nullptr;
@@ -59,6 +59,11 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
     chain += fmt::format(" {:08X}", saved_lr);
     frame = prev;
   }
+  return chain;
+}
+
+static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
+  const std::string chain = GuestBacktrace(ctx, base);
   REX_FATAL(
       "Call to invalid or unregistered function at guest address 0x{:08X} (lr={:08X} r1={:08X} "
       "r3={:08X} backtrace:{})",

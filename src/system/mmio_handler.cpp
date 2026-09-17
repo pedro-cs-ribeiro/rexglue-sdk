@@ -16,6 +16,8 @@
 #include <rex/assert.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/thread_state.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
@@ -481,9 +483,20 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
       }
       // Not a write watch: a genuine guest fault. Name the recompiled
       // function it happened in (the module PDBs make this readable).
-      REXLOG_ERROR("Guest access fault: {} of host {:p} from host pc {:#x} ({})",
+      std::string guest_chain;
+      if (auto* ts = ThreadState::Get()) {
+        if (auto* ctx = ts->context()) {
+          guest_chain = GuestBacktrace(*ctx, reinterpret_cast<const uint8_t*>(virtual_membase_));
+          guest_chain = fmt::format(
+              " lr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X} r11={:08X} r28={:08X} "
+              "r29={:08X} r30={:08X} r31={:08X} backtrace:{}",
+              static_cast<uint32_t>(ctx->lr), ctx->r1.u32, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32,
+              ctx->r11.u32, ctx->r28.u32, ctx->r29.u32, ctx->r30.u32, ctx->r31.u32, guest_chain);
+        }
+      }
+      REXLOG_ERROR("Guest access fault: {} of host {:p} from host pc {:#x} ({}){}",
                    is_write ? "write" : "read", fault_host_address, ex->pc(),
-                   DescribeHostPc(ex->pc()));
+                   DescribeHostPc(ex->pc()), guest_chain);
       return false;
     }
     return false;
