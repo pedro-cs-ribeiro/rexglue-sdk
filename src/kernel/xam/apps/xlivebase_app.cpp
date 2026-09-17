@@ -16,6 +16,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
+
+#include <fmt/format.h>
 
 namespace rex {
 namespace kernel {
@@ -106,10 +109,19 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
   }
+  // Dump the argument block: it is usually a small struct whose words are
+  // guest pointers and sizes, which is what identifies the call.
+  std::string words;
+  if (buffer_ptr && buffer_length && buffer_length <= 256) {
+    auto* p = memory_->TranslateVirtual<const uint8_t*>(buffer_ptr);
+    for (uint32_t i = 0; i + 4 <= buffer_length; i += 4) {
+      words += fmt::format(" {:02X}{:02X}{:02X}{:02X}", p[i], p[i + 1], p[i + 2], p[i + 3]);
+    }
+  }
   REXKRNL_ERROR(
       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
-      "arg2={:08X}",
-      app_id(), message, buffer_ptr, buffer_length);
+      "arg2={:08X}{}",
+      app_id(), message, buffer_ptr, buffer_length, words.empty() ? "" : " words:" + words);
   return X_E_FAIL;
 }
 
