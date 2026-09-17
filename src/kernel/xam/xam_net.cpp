@@ -19,6 +19,7 @@
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -179,6 +180,10 @@ struct XNetStartupParams {
   uint8_t cfgQosSrvMaxSimultaneousResponses;
   uint8_t cfgQosPairWaitTimeInSeconds;
 };
+
+REXCVAR_DEFINE_BOOL(net_loopback_only, false, "Kernel",
+                    "Bind sockets the title opens on any address to 127.0.0.1 instead, so an "
+                    "offline title never listens on a real interface (no firewall prompt).");
 
 XNetStartupParams xnet_startup_params = {};
 
@@ -670,6 +675,11 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  if (REXCVAR_GET(net_loopback_only) && native_name.sin_addr == 0) {
+    // INADDR_ANY -> loopback: keeps the socket usable for the title without
+    // exposing a listener on the host network.
+    native_name.sin_addr = 0x7F000001;
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
