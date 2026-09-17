@@ -15,13 +15,71 @@
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
-#include <disruptorplus/spin_wait_strategy.hpp>
+#include <disruptorplus/sequence.hpp>
+
+#include <condition_variable>
+#include <mutex>
 
 #include <rex/assert.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 
 namespace dp = disruptorplus;
+
+namespace {
+
+// Wait strategy for the timer thread: sleeps on a condition variable until a
+// sequence advances or the next timer is due. disruptorplus's spin strategy
+// yields and micro-sleeps through timed waits, which kept the timer thread
+// busy for about a fifth of a core during play, and its blocking strategy
+// passes the predicate and deadline to wait_until in the wrong order.
+class SleepingWaitStrategy {
+ public:
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[]) {
+    dp::sequence_t result;
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] {
+      result = dp::minimum_sequence_after(sequence, count, sequences);
+      return dp::difference(result, sequence) >= 0;
+    });
+    return result;
+  }
+
+  template <typename Rep, typename Period>
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[],
+                                      const std::chrono::duration<Rep, Period>& timeout) {
+    return wait_until_published(sequence, count, sequences,
+                                std::chrono::steady_clock::now() + timeout);
+  }
+
+  template <typename Clock, typename Duration>
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[],
+                                      const std::chrono::time_point<Clock, Duration>& deadline) {
+    dp::sequence_t result;
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_until(lock, deadline, [&] {
+      result = dp::minimum_sequence_after(sequence, count, sequences);
+      return dp::difference(result, sequence) >= 0;
+    });
+    return result;
+  }
+
+  void signal_all_when_blocking() {
+    // Take the lock so a waiter between its predicate check and its sleep
+    // cannot miss the notification.
+    { std::lock_guard<std::mutex> lock(mutex_); }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+};
+
+}  // namespace
 
 namespace rex::thread {
 
@@ -142,9 +200,9 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  SleepingWaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<SleepingWaitStrategy> claim_strategy_;
+  dp::sequence_barrier<SleepingWaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread
