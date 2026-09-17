@@ -24,9 +24,36 @@
 #include <rex/perf/counter.h>
 #include <SDL3/SDL.h>
 
+#include <cstdio>
+#include <string>
+
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_STRING(audio_dump_file, "", "Audio",
+                      "Append the mixed output (32-bit float, interleaved, device channels and rate) "
+                      "to this file for offline analysis");
 
 namespace rex::audio::sdl {
+
+namespace {
+
+// Diagnostic: mirror everything handed to SDL into audio_dump_file.
+void DumpOutput(const void* data, int len) {
+  static FILE* file = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    const std::string path = REXCVAR_GET(audio_dump_file);
+    if (!path.empty()) {
+      file = std::fopen(path.c_str(), "wb");
+    }
+  }
+  if (file) {
+    std::fwrite(data, 1, static_cast<size_t>(len), file);
+    std::fflush(file);
+  }
+}
+
+}  // namespace
 
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
     : AudioDriver(memory), semaphore_(semaphore) {}
@@ -187,6 +214,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         sdl_callback_count++;
       }
       std::memset(data, 0, len);
+      DumpOutput(data, len);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
@@ -212,6 +240,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             break;
         }
       }
+      DumpOutput(data, len);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
         driver->frames_unused_.push(buffer);
