@@ -98,6 +98,13 @@ bool build_twi(BuilderContext& ctx) {
   // twi 31, r0, <imm> is an unconditional trap with service code in the immediate
   if (to == 0x1F && ra == 0) {
     uint16_t trap_type = static_cast<uint16_t>(simm);
+    if (trap_type == 0 || trap_type == 22) {
+      // Breakpoint-style traps only warn; report where they fired so a
+      // title's assertion sites can be identified from the log.
+      ctx.println("\tREXCPU_WARN(\"tw/td trap hit at 0x{:08X} (type {})\");", ctx.base,
+                  trap_type);
+      return true;
+    }
     ctx.println("\tppc_trap(ctx, base, {});", trap_type);
     return true;
   }
