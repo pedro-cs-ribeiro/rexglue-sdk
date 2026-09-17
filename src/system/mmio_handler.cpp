@@ -21,6 +21,13 @@
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
+#if REX_PLATFORM_WINDOWS
+#include <windows.h>
+#include <dbghelp.h>
+#include <mutex>
+#include <string>
+#endif
+
 using namespace rex::arch;
 
 namespace rex::runtime {
@@ -364,6 +371,57 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
 #endif  // REX_ARCH
 }
 
+// Resolves a host code address to "module!symbol+offset" using the PDBs the
+// recompiled modules are built with, so a guest fault names the guest function
+// (sub_XXXXXXXX) it happened in. Diagnostics only; best effort.
+static std::string DescribeHostPc(uint64_t pc) {
+#if REX_PLATFORM_WINDOWS
+  static std::once_flag init_once;
+  static bool initialized = false;
+  std::call_once(init_once, [] {
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+    initialized = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != 0;
+  });
+  std::string result;
+  HMODULE module = nullptr;
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(pc), &module) &&
+      module) {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    const char* name = path;
+    for (const char* p = path; *p; ++p) {
+      if (*p == '\\' || *p == '/') name = p + 1;
+    }
+    result += name;
+    result += "+0x";
+    char offset[32];
+    snprintf(offset, sizeof(offset), "%llx",
+             static_cast<unsigned long long>(pc - reinterpret_cast<uint64_t>(module)));
+    result += offset;
+  }
+  if (initialized) {
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 255;
+    DWORD64 displacement = 0;
+    if (SymFromAddr(GetCurrentProcess(), pc, &displacement, symbol)) {
+      char tail[64];
+      snprintf(tail, sizeof(tail), "+0x%llx", static_cast<unsigned long long>(displacement));
+      result += result.empty() ? "" : " ";
+      result += symbol->Name;
+      result += tail;
+    }
+  }
+  return result.empty() ? "unknown" : result;
+#else
+  (void)pc;
+  return "unknown";
+#endif
+}
+
 bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
 }
@@ -417,8 +475,16 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                     fault_host_address, is_write)) {
+        return true;
+      }
+      // Not a write watch: a genuine guest fault. Name the recompiled
+      // function it happened in (the module PDBs make this readable).
+      REXLOG_ERROR("Guest access fault: {} of host {:p} from host pc {:#x} ({})",
+                   is_write ? "write" : "read", fault_host_address, ex->pc(),
+                   DescribeHostPc(ex->pc()));
+      return false;
     }
     return false;
   }
