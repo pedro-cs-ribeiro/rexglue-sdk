@@ -24,6 +24,9 @@
 #include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
+                    "Report keyboard controller input even while the window is not focused "
+                    "(automation aid: lets a script post key messages to the window)");
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "Use the mouse for the right stick. Off means the right stick comes "
                     "from the keybind_rstick_* keys only");
@@ -149,6 +152,10 @@ bool IsMouseLookActive() {
 
 using rex::ui::VirtualKey;
 
+bool MnkInputDriver::HasInputFocus() const {
+  return has_focus_ || REXCVAR_GET(mnk_ignore_focus);
+}
+
 MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
 
@@ -264,7 +271,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
                           has_focus_ && is_active());
 
-  if (!is_active() || !has_focus_) {
+  if (!is_active() || !HasInputFocus()) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -481,7 +488,7 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !HasInputFocus())
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
@@ -497,7 +504,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !HasInputFocus())
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -535,7 +542,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !HasInputFocus())
     return;
   int32_t x = e.x();
   int32_t y = e.y();

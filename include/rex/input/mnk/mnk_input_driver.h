@@ -45,6 +45,8 @@ class MnkInputDriver final : public InputDriver,
   void OnWindowAvailable(rex::ui::Window* window) override;
 
   // WindowInputListener
+  // True when the window is focused or mnk_ignore_focus is set.
+  bool HasInputFocus() const;
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;
   void OnMouseDown(rex::ui::MouseEvent& e) override;
