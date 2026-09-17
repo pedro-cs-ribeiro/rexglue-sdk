@@ -218,7 +218,16 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  // 0 = signed out, 1 = local profile, 2 = signed in to Live.
+  uint32_t signin_state() const { return signin_state_; }
+  void set_signin_state(uint32_t state) { signin_state_ = state; }
+  bool is_live_signed_in() const { return signin_state_ == 2; }
+  // Replaces the profile's identity (a host may load it from its own account
+  // store). Settings and everything else stay.
+  void SetIdentity(uint64_t xuid, std::string name) {
+    xuid_ = xuid;
+    name_ = std::move(name);
+  }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
@@ -229,6 +238,7 @@ class UserProfile {
  private:
   uint64_t xuid_;
   std::string name_;
+  uint32_t signin_state_ = 1;
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;

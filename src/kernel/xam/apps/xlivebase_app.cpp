@@ -9,9 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
+
+#include <cstdio>
+#include <cstring>
 
 namespace rex {
 namespace kernel {
@@ -44,11 +48,35 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
     case 0x00058007: {
-      // Occurs if title calls XOnlineGetServiceInfo, expects dwServiceId
-      // and pServiceInfo. pServiceInfo should contain pointer to
-      // XONLINE_SERVICE_INFO structure.
-      REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return 0x80151802;  // ERROR_CONNECTION_INVALID
+      // XOnlineGetServiceInfo(dwServiceId, XONLINE_SERVICE_INFO*): the XLSP
+      // lookup a title does to find its publisher's servers. arg1 is the
+      // service id by value, arg2 the output structure { DWORD dwServiceId;
+      // IN_ADDR inaServer; WORD wPort; WORD wReserved; }. With online play
+      // enabled every service is the configured server.
+      const uint32_t service_id = buffer_ptr;
+      const uint32_t out_guest = buffer_length;
+      if (!rex::cvar::Query<bool>("live_enabled")) {
+        REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X}) offline", service_id,
+                      out_guest);
+        return 0x80151802;  // ERROR_CONNECTION_INVALID
+      }
+      unsigned a = 127, b = 0, c = 0, d = 1;
+      const std::string ip = rex::cvar::Query<std::string>("live_server");
+      std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d);
+      const uint16_t port = static_cast<uint16_t>(rex::cvar::Query<uint32_t>("live_service_port"));
+      if (out_guest >= 0x1000u && out_guest < 0xC0000000u) {
+        auto out = memory_->TranslateVirtual(out_guest);
+        const uint8_t ipbytes[4] = {static_cast<uint8_t>(a), static_cast<uint8_t>(b),
+                                    static_cast<uint8_t>(c), static_cast<uint8_t>(d)};
+        memory::store_and_swap<uint32_t>(out + 0, service_id);
+        std::memcpy(out + 4, ipbytes, 4);
+        memory::store_and_swap<uint16_t>(out + 8, port);
+        memory::store_and_swap<uint16_t>(out + 10, 0);
+      }
+      if (rex::cvar::Query<bool>("live_trace")) {
+        REXKRNL_INFO("[live] GetServiceInfo service={:08X} -> {}:{}", service_id, ip, port);
+      }
+      return X_E_SUCCESS;
     }
     case 0x00058020: {
       // 0x00058004 is called right before this.

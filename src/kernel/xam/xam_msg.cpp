@@ -14,6 +14,7 @@
 
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -105,6 +106,11 @@ u32 XMsgCompleteIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 re
 
 u32 XamGetOverlappedResult_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mapped_u32 length_ptr,
                                  u32 unknown) {
+  if (rex::cvar::Query<bool>("live_trace")) {
+    REXKRNL_INFO("[live] XamGetOverlappedResult overlapped={:#x} wait={} result={:#x} length={}",
+                 overlapped_ptr.guest_address(), unknown, static_cast<uint32_t>(overlapped_ptr->result),
+                 static_cast<uint32_t>(overlapped_ptr->length));
+  }
   uint32_t result;
   if (overlapped_ptr->result != X_ERROR_IO_PENDING) {
     result = overlapped_ptr->result;

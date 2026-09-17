@@ -65,7 +65,53 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   return result;
 }
 
+// Online play against a private server: the title must see a user signed in
+// to Live with the privileges and membership tier its online menus check.
+// Whether that is on is decided by the networking layer's live_enabled option
+// (xam_net.cpp); the identity can be given by the host.
+REXCVAR_DEFINE_STRING(live_gamertag, "", "Live",
+                      "Gamertag of the signed-in user when online play is enabled")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(live_xuid, "", "Live",
+                      "XUID (hex) of the signed-in user when online play is enabled")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Diagnostics: which sign-in state and privilege answer online play reports
+// (defaults are the real ones: signed in to Live with every privilege).
+REXCVAR_DEFINE_UINT32(live_signin_state, 2, "Live",
+                      "Sign-in state reported while online play is enabled (1 local, 2 Live)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(live_privileges, true, "Live",
+                    "Grant every user privilege while online play is enabled")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+static bool LiveEnabled() { return rex::cvar::Query<bool>("live_enabled"); }
+
+// Applies live_gamertag/live_xuid to the profile once and marks it signed in
+// to Live while online play is enabled.
+static void SyncLiveIdentity() {
+  auto* profile = REX_KERNEL_STATE()->user_profile();
+  if (!profile) {
+    return;
+  }
+  static std::string applied_tag;
+  static std::string applied_xuid;
+  const std::string tag = REXCVAR_GET(live_gamertag);
+  const std::string xuid_text = REXCVAR_GET(live_xuid);
+  if (tag != applied_tag || xuid_text != applied_xuid) {
+    applied_tag = tag;
+    applied_xuid = xuid_text;
+    uint64_t xuid = profile->xuid();
+    if (!xuid_text.empty()) {
+      xuid = std::strtoull(xuid_text.c_str(), nullptr, 16);
+    }
+    profile->SetIdentity(xuid, tag.empty() ? profile->name() : tag);
+  }
+  profile->set_signin_state(LiveEnabled() ? REXCVAR_GET(live_signin_state) : 1);
+}
+
 u32 XamUserGetSigninState_entry(u32 user_index) {
+  SyncLiveIdentity();
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
@@ -96,6 +142,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
     return X_E_NO_SUCH_USER;
   }
 
+  SyncLiveIdentity();
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
@@ -382,8 +429,9 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // Offline: deny everything so games do not try online features. Online
+  // play grants every privilege (multiplayer, communications, content).
+  *out_value = (LiveEnabled() && REXCVAR_GET(live_privileges)) ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
