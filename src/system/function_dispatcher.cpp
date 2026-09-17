@@ -17,6 +17,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <fmt/format.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
@@ -34,9 +35,34 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
+  // Walk the guest back chain so the log names the call site and its callers:
+  // each frame stores the previous r1 at 0(r1) and the caller's LR at -8 of
+  // that previous frame (mflr r12; stw r12,-8(r1); stwu r1,-N(r1)). Every
+  // load is guarded with QueryProtect so a corrupt chain cannot fault here.
+  std::string chain;
+  Runtime* runtime = Runtime::instance();
+  auto* memory = runtime ? runtime->memory() : nullptr;
+  auto readable = [&](uint32_t address) {
+    uint32_t protect = 0;
+    auto* heap = memory ? memory->LookupHeap(address) : nullptr;
+    return heap && heap->QueryProtect(address, &protect) &&
+           (protect & rex::memory::kMemoryProtectRead);
+  };
+  uint32_t frame = ctx.r1.u32;
+  for (int depth = 0; depth < 16 && readable(frame); ++depth) {
+    uint32_t prev = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + frame));
+    if (prev <= frame || prev - frame > 0x100000 || !readable(prev - 8)) {
+      break;
+    }
+    uint32_t saved_lr = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + prev - 8));
+    chain += fmt::format(" {:08X}", saved_lr);
+    frame = prev;
+  }
+  REX_FATAL(
+      "Call to invalid or unregistered function at guest address 0x{:08X} (lr={:08X} r1={:08X} "
+      "r3={:08X} backtrace:{})",
+      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32, chain);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
@@ -181,7 +207,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
 
 bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
                                                  uint32_t image_base, uint32_t image_size,
-                                                 bool is_entrypoint) {
+                                                 bool is_entrypoint, uint32_t table_base) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
 
   if (is_entrypoint && entrypoint_code_base_ != 0) {
@@ -190,15 +216,37 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     return false;
   }
 
-  uint32_t new_table_end = image_base + image_size + (code_size + kThunkReserveSize) * 2;
+  if (!table_base) {
+    table_base = image_base + image_size;
+  }
+  uint32_t table_size = (code_size + kThunkReserveSize) * 2;
+  uint32_t new_table_end = table_base + table_size;
+  uint32_t new_image_end = image_base + image_size;
   uint32_t new_code_end = code_base + code_size + kThunkReserveSize;
+  auto overlaps = [](uint32_t a_lo, uint32_t a_hi, uint32_t b_lo, uint32_t b_hi) {
+    return a_lo < b_hi && a_hi > b_lo;
+  };
   for (const auto& existing : module_tables_) {
-    uint32_t existing_table_end =
-        existing.image_base + existing.image_size + (existing.code_size + kThunkReserveSize) * 2;
+    uint32_t existing_image_end = existing.image_base + existing.image_size;
+    uint32_t existing_table_end = existing.table_base + existing.table_size;
     uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
-    if (image_base < existing_table_end && new_table_end > existing.image_base) {
+    // Images may not overlap each other, and no dispatch table may overlap
+    // any image or another table. A table may live anywhere else, which is
+    // what lets a launcher sit directly in front of its engine DLL.
+    if (overlaps(image_base, new_image_end, existing.image_base, existing_image_end)) {
       REXLOG_ERROR("Module image range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
-                   image_base, new_table_end, existing.image_base, existing_table_end);
+                   image_base, new_image_end, existing.image_base, existing_image_end);
+      return false;
+    }
+    if (overlaps(table_base, new_table_end, existing.image_base, existing_image_end) ||
+        overlaps(table_base, new_table_end, existing.table_base, existing_table_end) ||
+        overlaps(image_base, new_image_end, existing.table_base, existing_table_end)) {
+      REXLOG_ERROR(
+          "Module dispatch table [{:08X}, {:08X}) for image [{:08X}, {:08X}) collides with "
+          "existing image [{:08X}, {:08X}) / table [{:08X}, {:08X}); set function_table_base "
+          "in the codegen config to relocate it",
+          table_base, new_table_end, image_base, new_image_end, existing.image_base,
+          existing_image_end, existing.table_base, existing_table_end);
       return false;
     }
     if (code_base < existing_code_end && new_code_end > existing.code_base) {
@@ -208,7 +256,8 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     }
   }
 
-  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size)) {
+  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size,
+                                        table_base)) {
     REXLOG_ERROR("Failed to initialize guest memory function table");
     return false;
   }
@@ -218,6 +267,8 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
       .code_size = code_size,
       .image_base = image_base,
       .image_size = image_size,
+      .table_base = table_base,
+      .table_size = table_size,
       .next_thunk_address = code_base + code_size,
       .thunk_limit = code_base + code_size + kThunkReserveSize,
   });
@@ -226,8 +277,11 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     entrypoint_code_base_ = code_base;
   }
 
-  REXLOG_INFO("Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}",
-              code_base, code_base + code_size, image_base, image_base + image_size);
+  REXLOG_INFO(
+      "Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}, "
+      "table={:08X}-{:08X}",
+      code_base, code_base + code_size, image_base, image_base + image_size, table_base,
+      new_table_end);
   return true;
 }
 

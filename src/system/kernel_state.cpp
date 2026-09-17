@@ -787,7 +787,8 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
               xex->base_address() + xex->image_size());
         } else if (!function_dispatcher_->InitializeFunctionTable(
                        image_info->code_base, image_info->code_size, image_info->image_base,
-                       image_info->image_size)) {
+                       image_info->image_size, /*is_entrypoint=*/false,
+                       image_info->table_base)) {
           REXSYS_ERROR("InitializeFunctionTable failed for module '{}'", recomp->pe_name);
         } else {
           function_dispatcher_->RegisterModule(lib_key, image_info->code_base, register_func);

@@ -107,6 +107,11 @@ struct RecompilerConfig {
   // from the module's position in the manifest (entrypoint = false, modules = true).
   std::optional<bool> isDll;
 
+  // Optional guest address for the module's indirect-call dispatch table.
+  // Defaults to the end of the image; set it when another module is mapped
+  // there (a launcher whose engine DLL sits right after it, for example).
+  uint32_t functionTableBase = 0;
+
   // === Manual overrides ===
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
   std::unordered_map<uint32_t, JumpTable> switchTables;

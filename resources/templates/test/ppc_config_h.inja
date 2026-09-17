@@ -28,6 +28,8 @@
 #define REX_CODE_BASE 0x{{ code_base }}ull
 #define REX_CODE_SIZE 0x{{ code_size }}ull
 #define REX_THUNK_RESERVE_SIZE 0x10000ull
+// Dispatch table location: tests use the default placement (right after the image).
+#define REX_TABLE_BASE (REX_IMAGE_BASE + REX_IMAGE_SIZE)
 
 #endif // REX_CONFIG_H_INCLUDED
 

@@ -97,6 +97,10 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"image_size", fmt::format("0x{:X}", ctx.binary().imageSize())},
       {"code_base", fmt::format("0x{:X}", codeMin)},
       {"code_size", fmt::format("0x{:X}", codeMax - codeMin)},
+      {"table_base",
+       fmt::format("0x{:X}", cfg.functionTableBase
+                                  ? cfg.functionTableBase
+                                  : ctx.binary().baseAddress() + ctx.binary().imageSize())},
       {"rexcrt_heap", cfg.rexcrtFunctions.contains("RtlAllocateHeap") ? 1 : 0},
       {"thunk_reserve_size", fmt::format("0x{:X}", 0x10000u)},
       {"has_dll_modules", ctx.hasDllModules()},

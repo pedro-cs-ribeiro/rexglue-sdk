@@ -119,6 +119,10 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }
+  if (auto v = toml["function_table_base"].value<int64_t>()) {
+    uint32_t addr = static_cast<uint32_t>(*v);
+    MergeScalar(cfg.functionTableBase, addr, "function_table_base");
+  }
 
   // Integer scalars (only override if present)
   if (auto v = toml["longjmp_address"].value<int64_t>()) {

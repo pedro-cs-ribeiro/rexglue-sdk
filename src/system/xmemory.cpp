@@ -785,9 +785,11 @@ bool Memory::Restore(stream::ByteStream* stream) {
 //=============================================================================
 
 bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                                     uint32_t image_size) {
+                                     uint32_t image_size, uint32_t table_base) {
   constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;
-  uint32_t table_base = image_base + image_size;
+  if (!table_base) {
+    table_base = image_base + image_size;
+  }
   uint32_t table_size = (code_size + kThunkReserveSize) * 2;
 
   REXSYS_DEBUG(
