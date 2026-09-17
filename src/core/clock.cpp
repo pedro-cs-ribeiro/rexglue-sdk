@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <atomic>
 #include <mutex>
 
 #include <rex/chrono/clock.h>
@@ -30,17 +31,60 @@ double guest_time_scalar_ = 1.0;
 uint64_t guest_tick_frequency_ = Clock::host_tick_frequency_platform();
 // Base FILETIME of the guest system from app start.
 uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
-// Combined time and frequency ratio between host and guest.
-// Split in numerator (first) and denominator (second).
-// Computed by RecomputeGuestTickScalar.
-std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
-
-// Native guest ticks.
-uint64_t last_guest_tick_count_ = 0;
-// Last sampled host tick count.
-uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
-// Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
+// Guest time is host time re-based whenever the scalar or the frequency
+// changes: guest = base_guest + (host - base_host) * ratio. The base is
+// written under tick_mutex_ and published through a sequence number, so
+// readers never take a lock. Several threads poll this clock continuously (a
+// game's frame-pacing loop, the vblank timer, the GPU's waits); when the
+// update was serialised through the mutex the readers stalled on each other,
+// the vblank timer drifted and frames doubled during play.
+struct ClockBase {
+  std::atomic<uint64_t> host_ticks{0};
+  std::atomic<uint64_t> guest_ticks{0};
+  std::atomic<uint64_t> ratio_num{1};
+  std::atomic<uint64_t> ratio_den{1};
+};
+ClockBase clock_base_;
+std::atomic<uint32_t> clock_base_sequence_{0};
+// Serialises writers of clock_base_.
 std::mutex tick_mutex_;
+
+struct ClockBaseSnapshot {
+  uint64_t host_ticks;
+  uint64_t guest_ticks;
+  uint64_t ratio_num;
+  uint64_t ratio_den;
+};
+
+ClockBaseSnapshot ReadClockBase() {
+  for (;;) {
+    const uint32_t before = clock_base_sequence_.load(std::memory_order_acquire);
+    if (before & 1) {
+      continue;  // a writer is mid-update
+    }
+    ClockBaseSnapshot snapshot{clock_base_.host_ticks.load(std::memory_order_relaxed),
+                              clock_base_.guest_ticks.load(std::memory_order_relaxed),
+                              clock_base_.ratio_num.load(std::memory_order_relaxed),
+                              clock_base_.ratio_den.load(std::memory_order_relaxed)};
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (clock_base_sequence_.load(std::memory_order_relaxed) == before) {
+      return snapshot;
+    }
+  }
+}
+
+uint64_t GuestTicksFromHost(const ClockBaseSnapshot& base, uint64_t host_ticks) {
+  const uint64_t delta = host_ticks > base.host_ticks ? host_ticks - base.host_ticks : 0;
+  return base.guest_ticks + delta * base.ratio_num / base.ratio_den;
+}
+
+void InitializeClockBase() {
+  static const bool once = [] {
+    clock_base_.host_ticks.store(Clock::QueryHostTickCount(), std::memory_order_relaxed);
+    return true;
+  }();
+  (void)once;
+}
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -57,35 +101,30 @@ void RecomputeGuestTickScalar() {
   // Keep this a rational calculation and reduce the fraction
   reduce_fraction(frac);
 
+  InitializeClockBase();
   std::lock_guard<std::mutex> lock(tick_mutex_);
-  guest_tick_ratio_ = frac;
+  // Re-base so guest time continues from its current value with the new ratio.
+  const uint64_t host_ticks = Clock::QueryHostTickCount();
+  const uint64_t guest_ticks = GuestTicksFromHost(ReadClockBase(), host_ticks);
+  clock_base_sequence_.fetch_add(1, std::memory_order_release);
+  std::atomic_thread_fence(std::memory_order_release);
+  clock_base_.host_ticks.store(host_ticks, std::memory_order_relaxed);
+  clock_base_.guest_ticks.store(guest_ticks, std::memory_order_relaxed);
+  clock_base_.ratio_num.store(frac.first, std::memory_order_relaxed);
+  clock_base_.ratio_den.store(frac.second, std::memory_order_relaxed);
+  clock_base_sequence_.fetch_add(1, std::memory_order_release);
 }
 
-// Update the guest timer for all threads.
-// Return a copy of the value so locking is reduced.
+// Guest tick count for the current host time. Lock-free; see ClockBase.
 uint64_t UpdateGuestClock() {
-  uint64_t host_tick_count = Clock::QueryHostTickCount();
-
+  InitializeClockBase();
+  const uint64_t host_tick_count = Clock::QueryHostTickCount();
+  const ClockBaseSnapshot base = ReadClockBase();
   if (REXCVAR_GET(clock_no_scaling)) {
-    // Nothing to update, calculate on the fly
-    return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
+    // Nothing to re-base, calculate on the fly
+    return host_tick_count * base.ratio_num / base.ratio_den;
   }
-
-  std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
-  if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta =
-        host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    last_guest_tick_count_ += guest_tick_delta;
-    return last_guest_tick_count_;
-  } else {
-    // Wait until another thread has finished updating the clock.
-    lock.lock();
-    return last_guest_tick_count_;
-  }
+  return GuestTicksFromHost(base, host_tick_count);
 }
 
 // Offset of the current guest system file time relative to the guest base time.
@@ -134,8 +173,8 @@ void Clock::set_guest_time_scalar(double scalar) {
 }
 
 std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
-  std::lock_guard<std::mutex> lock(tick_mutex_);
-  return guest_tick_ratio_;
+  const ClockBaseSnapshot base = ReadClockBase();
+  return std::make_pair(base.ratio_num, base.ratio_den);
 }
 
 uint64_t Clock::guest_tick_frequency() {
