@@ -19,6 +19,8 @@
 #include "platform_win.h"
 
 #include <rex/filesystem.h>
+
+#include <iterator>
 #include <rex/logging.h>
 #include <rex/string.h>
 
@@ -43,9 +45,15 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
-  wchar_t* path;
-  auto error = _get_wpgmptr(&path);
-  return !error ? std::filesystem::path(path) : std::filesystem::path();
+  // Not _get_wpgmptr: the wide program pointer is only set by a wide entry
+  // point, and querying it from a narrow main() trips the CRT's invalid
+  // parameter handler (fast-fail). The loader always knows the path.
+  wchar_t buffer[4096];
+  DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+  if (length == 0 || length >= std::size(buffer)) {
+    return std::filesystem::path();
+  }
+  return std::filesystem::path(buffer, buffer + length);
 }
 
 std::filesystem::path GetExecutableFolder() {
