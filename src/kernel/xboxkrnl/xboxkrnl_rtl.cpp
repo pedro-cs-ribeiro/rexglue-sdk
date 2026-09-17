@@ -20,7 +20,12 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
+#include <chrono>
+
+#include <rex/cvar.h>
 #include <rex/hook.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/thread_state.h>
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -398,6 +403,31 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
+    if (rex::cvar::Query<bool>("wait_trace")) {
+      // Diagnostic (see wait_trace): who blocks on which section, and who
+      // owns it, with a guest backtrace of the blocked thread.
+      static const auto start = std::chrono::steady_clock::now();
+      const double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      if (elapsed >= rex::cvar::Query<double>("wait_trace_after")) {
+        std::string chain;
+        if (auto* ts = rex::runtime::ThreadState::Get()) {
+          if (auto* ctx = ts->context()) {
+            chain = rex::runtime::GuestBacktrace(*ctx, REX_KERNEL_STATE()->memory()->virtual_membase());
+          }
+        }
+        std::string owner = "?";
+        if (cs->owning_thread) {
+          auto thread = XObject::GetNativeObject<XThread>(
+              REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(cs->owning_thread));
+          if (thread) {
+            owner = fmt::format("{} (guest tid {})", thread->name(), thread->thread_id());
+          }
+        }
+        REXKRNL_INFO("[crit] blocking on cs={:#x} owner={:#x} = {}; backtrace:{}", cs.guest_address(),
+                     static_cast<uint32_t>(cs->owning_thread), owner, chain);
+      }
+    }
     // Create a full waiter.
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
   }

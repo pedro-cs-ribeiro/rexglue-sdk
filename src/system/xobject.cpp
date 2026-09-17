@@ -12,6 +12,12 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/thread_state.h>
+#include <map>
+#include <mutex>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -28,6 +34,47 @@
 #include <rex/system/xthread.h>
 
 namespace rex::system {
+
+// Diagnostic: log a guest backtrace for the first infinite waits of each
+// thread, to see what a stuck thread is waiting for.
+REXCVAR_DEFINE_BOOL(wait_trace, false, "Kernel",
+                    "Log guest backtraces for infinite object waits (first few per thread)");
+REXCVAR_DEFINE_DOUBLE(wait_trace_after, 0.0, "Kernel",
+                      "Seconds after launch before wait_trace starts logging");
+REXCVAR_DEFINE_BOOL(wait_trace_timed, false, "Kernel", "wait_trace also logs timed waits");
+
+namespace {
+void TraceInfiniteWait(const char* api, const XObject* object, const uint64_t* timeout = nullptr) {
+  if (!REXCVAR_GET(wait_trace) || (timeout && !REXCVAR_GET(wait_trace_timed))) {
+    return;
+  }
+  static const auto start = std::chrono::steady_clock::now();
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  if (elapsed < REXCVAR_GET(wait_trace_after)) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::map<uint32_t, uint32_t> per_thread;
+  const uint32_t tid = rex::thread::current_thread_system_id();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (per_thread[tid]++ >= 6) {
+      return;
+    }
+  }
+  std::string chain;
+  if (auto* ts = rex::runtime::ThreadState::Get()) {
+    if (auto* ctx = ts->context()) {
+      chain = rex::runtime::GuestBacktrace(*ctx, kernel_state()->memory()->virtual_membase());
+    }
+  }
+  REXLOG_INFO("[wait] {} object={:#x} type={} timeout={}; backtrace:{}", api,
+              object ? object->guest_object() : 0u,
+              object ? static_cast<uint32_t>(object->type()) : 0xFFFFFFFFu,
+              timeout ? static_cast<int64_t>(*timeout) : 0, chain);
+}
+}  // namespace
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -212,6 +259,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  TraceInfiniteWait("Wait", this, opt_timeout);
   XThread::CheckTitleTermination();
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
   XThread::CheckTitleTermination();
@@ -239,6 +287,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  TraceInfiniteWait("SignalAndWait", wait_object, opt_timeout);
   auto result =
       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
                                  alertable ? true : false, timeout_ms);
@@ -272,6 +321,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  TraceInfiniteWait(wait_type ? "WaitAny" : "WaitAll", count ? objects[0] : nullptr, opt_timeout);
   XThread::CheckTitleTermination();
   if (wait_type) {
     auto result =
