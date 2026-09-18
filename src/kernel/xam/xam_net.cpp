@@ -194,7 +194,7 @@ REXCVAR_DEFINE_BOOL(live_enabled, false, "Live", "Enable online play against a p
 REXCVAR_DEFINE_STRING(live_server, "127.0.0.1", "Live",
                       "IPv4 address every online service lookup resolves to")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_UINT32(live_service_port, 42127, "Live",
+REXCVAR_DEFINE_UINT32(live_service_port, 42124, "Live",
                       "Port returned for XLSP service lookups (the title server's front door)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(live_trace, false, "Live", "Log every online-related kernel call")
