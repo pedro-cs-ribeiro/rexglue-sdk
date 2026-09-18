@@ -44,6 +44,10 @@ enum class ReadbackResolveMode {
   kFast,
   kSome,
   kFull,
+  // No copy at resolve time: the destination is handed to the memory system's
+  // data providers and read back (synchronously, once) when the CPU first
+  // touches it.
+  kLazy,
 };
 
 struct SwapState {
@@ -169,6 +173,16 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  // Work other threads need the command processor thread to do (for instance
+  // reading GPU memory back for a data provider). Backends override
+  // ServiceHostRequests; the flag keeps the check in hot paths cheap.
+  virtual void ServiceHostRequests() {}
+  void ServiceHostRequestsIfAny() {
+    if (host_requests_pending_.load(std::memory_order_acquire)) {
+      ServiceHostRequests();
+    }
+  }
+
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
@@ -239,6 +253,7 @@ class CommandProcessor {
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
+  std::atomic<bool> host_requests_pending_{false};
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;

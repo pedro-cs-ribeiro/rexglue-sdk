@@ -50,8 +50,9 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
                       " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " full: Immediate sync readback (accurate but stalls)\n"
+                      " lazy: Read back on the CPU's first access to the result")
+    .allowed({"none", "fast", "some", "full", "lazy"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
@@ -95,6 +96,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   if (value == "full") {
     return ReadbackResolveMode::kFull;
+  }
+  if (value == "lazy") {
+    return ReadbackResolveMode::kLazy;
   }
   return ReadbackResolveMode::kDisabled;
 }
@@ -204,6 +208,7 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
+    ServiceHostRequestsIfAny();
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -227,6 +232,7 @@ void CommandProcessor::WorkerThreadMain() {
         }
 
         rex::thread::MaybeYield();
+        ServiceHostRequestsIfAny();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
@@ -663,6 +669,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  ServiceHostRequestsIfAny();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -1049,6 +1056,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       } else {
         rex::thread::MaybeYield();
       }
+      // A guest thread may be waiting on us for GPU memory while we wait on
+      // it for the register value.
+      ServiceHostRequestsIfAny();
     }
   } while (!matched);
 

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -366,6 +367,50 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
+
+  // Lazy resolve readback (ReadbackResolveMode::kLazy): a resolve only records
+  // its destination and hands the pages to the memory system's data
+  // providers; the first CPU access to them asks this thread, through the
+  // provider callback, to copy the current GPU contents back.
+  struct LazyResolveRecord {
+    uint32_t address;
+    uint32_t length;
+    uint32_t pixel_size_log2;
+    bool scaled;
+    // Small unscaled results are also copied into the readback ring in the
+    // submission that produced them, so delivery only has to wait for that
+    // submission's fence, which has usually passed by the time the guest
+    // reads the result.
+    bool in_ring = false;
+    uint64_t ring_offset = 0;
+    uint64_t submission = 0;
+  };
+  struct LazyReadbackRequest {
+    std::vector<LazyResolveRecord> records;
+    std::unique_ptr<rex::thread::Event> done;
+    bool ok = false;
+  };
+  void RecordLazyResolve(uint32_t address, uint32_t length);
+  void RecordLazyRange(uint32_t address, uint32_t length, bool scaled, uint32_t pixel_size_log2);
+  static bool LazyReadbackProviderThunk(void* context, uint32_t address, uint32_t length,
+                                        uint32_t* out_address, uint32_t* out_length);
+  bool LazyReadbackProvider(uint32_t address, uint32_t length, uint32_t* out_address,
+                            uint32_t* out_length);
+  void ServiceHostRequests() override;
+  // On the command processor thread: copies what the GPU currently holds for
+  // the record's range into CPU-visible guest memory.
+  bool CopyResolvedRangeToHost(const LazyResolveRecord& record);
+  bool EnsureLazyRing();
+  // Downscales the current scaled resolve range (set by the resolve or by
+  // MakeScaledResolveRangeCurrent) to the guest layout and copies `length`
+  // bytes of it into `dest` at `dest_offset`.
+  bool DownscaleCurrentScaledResolve(uint32_t length, uint32_t pixel_size_log2,
+                                     ID3D12Resource* dest, uint64_t dest_offset);
+  // On any thread: delivers a ring-copied record once its submission has
+  // completed, or returns false if the ring copy is unavailable.
+  bool TryDeliverFromRing(const LazyResolveRecord& record);
+  static constexpr uint32_t kLazyRingSize = 16 << 20;
+  static constexpr uint32_t kLazyRingMaxRecord = 256 << 10;
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -645,6 +690,16 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
+  std::mutex lazy_readback_mutex_;
+  std::vector<LazyResolveRecord> lazy_resolves_;
+  std::deque<LazyReadbackRequest*> lazy_requests_;
+  void* lazy_readback_provider_handle_ = nullptr;
+  ID3D12Resource* lazy_ring_ = nullptr;
+  uint8_t* lazy_ring_mapping_ = nullptr;
+  std::atomic<uint64_t> lazy_ring_head_{0};
+  // Index of the last submission that was ended (its fence value), readable
+  // from other threads.
+  std::atomic<uint64_t> submission_ended_{0};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 

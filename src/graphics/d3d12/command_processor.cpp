@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -926,6 +927,8 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
+  lazy_readback_provider_handle_ =
+      memory_->RegisterPhysicalMemoryDataProvider(&LazyReadbackProviderThunk, this);
   if (!shared_memory_->Initialize()) {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
@@ -1734,6 +1737,30 @@ void D3D12CommandProcessor::ShutdownContext() {
   constant_buffer_pool_.reset();
 
   render_target_cache_.reset();
+
+  if (lazy_readback_provider_handle_) {
+    memory_->UnregisterPhysicalMemoryDataProvider(lazy_readback_provider_handle_);
+    lazy_readback_provider_handle_ = nullptr;
+  }
+  {
+    // Release anyone still waiting on us; there is no GPU to read from now.
+    std::lock_guard<std::mutex> lock(lazy_readback_mutex_);
+    for (LazyReadbackRequest* request : lazy_requests_) {
+      request->ok = false;
+      request->done->Set();
+    }
+    lazy_requests_.clear();
+    lazy_resolves_.clear();
+  }
+  if (lazy_ring_) {
+    if (lazy_ring_mapping_) {
+      D3D12_RANGE written_range = {0, 0};
+      lazy_ring_->Unmap(0, &written_range);
+      lazy_ring_mapping_ = nullptr;
+    }
+    lazy_ring_->Release();
+    lazy_ring_ = nullptr;
+  }
 
   shared_memory_.reset();
 
@@ -2711,8 +2738,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
-    if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
-        !memexport_ranges_.empty()) {
+    if (GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)) ==
+        ReadbackResolveMode::kLazy) {
+      // Same as resolves: hand the exported ranges to the data providers and
+      // copy them back only when the CPU touches them.
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        RecordLazyRange(memexport_range.base_address_dwords << 2, memexport_range.size_bytes,
+                        false, 2);
+      }
+    } else if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
+               !memexport_ranges_.empty()) {
       uint32_t memexport_total_size = 0;
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
@@ -2878,12 +2913,384 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled ||
+      readback_mode == ReadbackResolveMode::kLazy) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                       written_address, written_length)) {
+      return false;
+    }
+    if (readback_mode == ReadbackResolveMode::kLazy && written_length) {
+      RecordLazyResolve(written_address, written_length);
+    }
+    return true;
   }
   return IssueCopy_ReadbackResolvePath();
+}
+
+void D3D12CommandProcessor::RecordLazyResolve(uint32_t address, uint32_t length) {
+  uint32_t pixel_size_log2_value = 2;
+  reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+  const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
+  uint32_t bits_per_pixel = format_info ? format_info->bits_per_pixel : 32;
+  uint32_t pixel_size_log2;
+  if ((bits_per_pixel == 8 || bits_per_pixel == 16 || bits_per_pixel == 32 ||
+       bits_per_pixel == 64) &&
+      rex::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2)) {
+    pixel_size_log2_value = pixel_size_log2;
+  }
+  RecordLazyRange(address, length, texture_cache_->IsDrawResolutionScaled(),
+                  pixel_size_log2_value);
+}
+
+void D3D12CommandProcessor::RecordLazyRange(uint32_t address, uint32_t length, bool scaled,
+                                            uint32_t pixel_size_log2) {
+  if (!length || !memory_->TranslatePhysical(address)) {
+    return;
+  }
+  LazyResolveRecord record;
+  record.address = address;
+  record.length = length;
+  record.scaled = scaled;
+  record.pixel_size_log2 = pixel_size_log2;
+  if (length <= kLazyRingMaxRecord && EnsureLazyRing()) {
+    uint64_t offset = rex::align(lazy_ring_head_.load(std::memory_order_relaxed), uint64_t(512));
+    if ((offset % kLazyRingSize) + length > kLazyRingSize) {
+      offset += kLazyRingSize - (offset % kLazyRingSize);
+    }
+    bool copied;
+    if (scaled) {
+      // Called right after the resolve, whose scaled range is still current.
+      copied = DownscaleCurrentScaledResolve(length, pixel_size_log2, lazy_ring_,
+                                             offset % kLazyRingSize);
+    } else {
+      shared_memory_->UseAsCopySource();
+      SubmitBarriers();
+      deferred_command_list_.D3DCopyBufferRegion(lazy_ring_, offset % kLazyRingSize,
+                                                 shared_memory_->GetBuffer(), address, length);
+      copied = true;
+    }
+    if (copied) {
+      lazy_ring_head_.store(offset + length, std::memory_order_release);
+      record.in_ring = true;
+      record.ring_offset = offset;
+      record.submission = submission_current_;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(lazy_readback_mutex_);
+    // A newer resolve replaces older records it fully covers; partial
+    // overlaps stay, a request delivers every record touching its range.
+    const uint64_t end = uint64_t(address) + length;
+    lazy_resolves_.erase(std::remove_if(lazy_resolves_.begin(), lazy_resolves_.end(),
+                                        [&](const LazyResolveRecord& r) {
+                                          return r.address >= address &&
+                                                 uint64_t(r.address) + r.length <= end;
+                                        }),
+                         lazy_resolves_.end());
+    lazy_resolves_.push_back(record);
+  }
+  memory_->EnablePhysicalMemoryAccessCallbacks(address, length, false, true);
+}
+
+// Why the last TryDeliverFromRing on this thread fell back (for the log).
+static thread_local const char* g_lazy_ring_miss_reason = "";
+
+bool D3D12CommandProcessor::LazyReadbackProviderThunk(void* context, uint32_t address,
+                                                      uint32_t length, uint32_t* out_address,
+                                                      uint32_t* out_length) {
+  return static_cast<D3D12CommandProcessor*>(context)->LazyReadbackProvider(
+      address, length, out_address, out_length);
+}
+
+bool D3D12CommandProcessor::LazyReadbackProvider(uint32_t address, uint32_t length,
+                                                 uint32_t* out_address, uint32_t* out_length) {
+  auto* request = new LazyReadbackRequest();
+  uint64_t provided_start = UINT64_MAX, provided_end = 0;
+  {
+    std::lock_guard<std::mutex> lock(lazy_readback_mutex_);
+    const uint64_t end = uint64_t(address) + length;
+    for (auto it = lazy_resolves_.begin(); it != lazy_resolves_.end();) {
+      const uint64_t record_end = uint64_t(it->address) + it->length;
+      if (it->address < end && record_end > address) {
+        provided_start = std::min<uint64_t>(provided_start, it->address);
+        provided_end = std::max(provided_end, record_end);
+        request->records.push_back(*it);
+        it = lazy_resolves_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (request->records.empty()) {
+    delete request;
+    return false;
+  }
+  *out_address = uint32_t(provided_start);
+  *out_length = uint32_t(provided_end - provided_start);
+  const auto request_start = std::chrono::steady_clock::now();
+  const bool inline_service = system::XThread::IsInThread(worker_thread_.get());
+
+  // Ring copies of completed submissions need no help from the GPU thread.
+  request->records.erase(
+      std::remove_if(request->records.begin(), request->records.end(),
+                     [this](const LazyResolveRecord& record) { return TryDeliverFromRing(record); }),
+      request->records.end());
+  const bool served_from_ring = request->records.empty();
+  if (served_from_ring) {
+    request->ok = true;
+  } else if (system::XThread::IsInThread(worker_thread_.get())) {
+    // Our own thread touched the memory: do it right here.
+    request->ok = true;
+    for (const LazyResolveRecord& record : request->records) {
+      request->ok &= CopyResolvedRangeToHost(record);
+    }
+  } else {
+    request->done = rex::thread::Event::CreateManualResetEvent(false);
+    {
+      std::lock_guard<std::mutex> lock(lazy_readback_mutex_);
+      lazy_requests_.push_back(request);
+    }
+    host_requests_pending_.store(true, std::memory_order_release);
+    write_ptr_index_event_->Set();
+    if (rex::thread::Wait(request->done.get(), false, std::chrono::milliseconds(5000)) !=
+        rex::thread::WaitResult::kSuccess) {
+      REXGPU_ERROR("Lazy resolve readback of {:08X}+{:#x} timed out waiting for the GPU thread",
+                   *out_address, *out_length);
+      // Leak the request: the thread may still complete it later.
+      return true;
+    }
+  }
+  if (!request->ok) {
+    REXGPU_WARN("Lazy resolve readback of {:08X}+{:#x} did not complete", *out_address,
+                *out_length);
+  }
+  REXGPU_DEBUG("lazy resolve readback: {:08X}+{:#x} delivered {:08X}+{:#x} in {:.0f} us ({}{})",
+               address, length, *out_address, *out_length,
+               std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+                                                         request_start)
+                   .count(),
+               served_from_ring ? "ring" : (inline_service ? "inline" : "GPU thread"),
+               *g_lazy_ring_miss_reason ? g_lazy_ring_miss_reason : "");
+  delete request;
+  return true;
+}
+
+void D3D12CommandProcessor::ServiceHostRequests() {
+  for (;;) {
+    LazyReadbackRequest* request = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(lazy_readback_mutex_);
+      if (lazy_requests_.empty()) {
+        host_requests_pending_.store(false, std::memory_order_release);
+        return;
+      }
+      request = lazy_requests_.front();
+      lazy_requests_.pop_front();
+    }
+    bool ok = true;
+    for (const LazyResolveRecord& record : request->records) {
+      ok &= CopyResolvedRangeToHost(record);
+    }
+    request->ok = ok;
+    request->done->Set();
+  }
+}
+
+bool D3D12CommandProcessor::EnsureLazyRing() {
+  if (lazy_ring_) {
+    return lazy_ring_mapping_ != nullptr;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, kLazyRingSize, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&lazy_ring_)))) {
+    REXGPU_ERROR("Failed to create the {} MB lazy readback ring", kLazyRingSize >> 20);
+    lazy_ring_ = nullptr;
+    return false;
+  }
+  D3D12_RANGE read_range = {0, kLazyRingSize};
+  void* mapping = nullptr;
+  if (FAILED(lazy_ring_->Map(0, &read_range, &mapping))) {
+    REXGPU_ERROR("Failed to map the lazy readback ring");
+    lazy_ring_->Release();
+    lazy_ring_ = nullptr;
+    return false;
+  }
+  lazy_ring_mapping_ = static_cast<uint8_t*>(mapping);
+  return true;
+}
+
+bool D3D12CommandProcessor::TryDeliverFromRing(const LazyResolveRecord& record) {
+  g_lazy_ring_miss_reason = record.in_ring ? "" : (record.scaled ? "scaled" : "not in ring");
+  if (!record.in_ring || !lazy_ring_mapping_) {
+    return false;
+  }
+  auto slice_valid = [&]() {
+    return lazy_ring_head_.load(std::memory_order_acquire) - record.ring_offset <= kLazyRingSize;
+  };
+  if (!slice_valid()) {
+    g_lazy_ring_miss_reason = "ring overwritten";
+    return false;
+  }
+  if (submission_ended_.load(std::memory_order_acquire) < record.submission) {
+    // Still being recorded; the GPU thread has to end the submission first.
+    g_lazy_ring_miss_reason = "submission open";
+    return false;
+  }
+  if (submission_fence_->GetCompletedValue() < record.submission) {
+    static thread_local HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!wait_event ||
+        FAILED(submission_fence_->SetEventOnCompletion(record.submission, wait_event))) {
+      return false;
+    }
+    if (WaitForSingleObject(wait_event, 5000) != WAIT_OBJECT_0) {
+      return false;
+    }
+  }
+  if (!slice_valid()) {
+    return false;
+  }
+  std::memcpy(memory_->TranslatePhysical(record.address),
+              lazy_ring_mapping_ + (record.ring_offset % kLazyRingSize), record.length);
+  return true;
+}
+
+bool D3D12CommandProcessor::DownscaleCurrentScaledResolve(uint32_t length,
+                                                          uint32_t pixel_size_log2,
+                                                          ID3D12Resource* dest,
+                                                          uint64_t dest_offset) {
+  uint32_t tile_size_1x = 32 * 32 * (uint32_t(1) << pixel_size_log2);
+  uint32_t tile_count = length / tile_size_1x;
+  uint32_t scaled_length = uint32_t(texture_cache_->GetCurrentScaledResolveRangeLengthScaled());
+  uint64_t scaled_address = texture_cache_->GetCurrentScaledResolveRangeStartScaled();
+  if (!tile_count || !scaled_length || !resolve_downscale_pipeline_ ||
+      !resolve_downscale_root_signature_) {
+    return false;
+  }
+  uint32_t downscale_buffer_size = AlignReadbackBufferSize(length);
+  if (downscale_buffer_size > resolve_downscale_buffer_size_) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, downscale_buffer_size,
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    ID3D12Resource* buffer = nullptr;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&buffer)))) {
+      REXGPU_ERROR("Failed to create a {} MB resolve downscale buffer",
+                   downscale_buffer_size >> 20);
+      return false;
+    }
+    if (resolve_downscale_buffer_) {
+      resources_for_deletion_.emplace_back(GetCurrentSubmission(),
+                                           resolve_downscale_buffer_.Detach());
+    }
+    resolve_downscale_buffer_.Attach(buffer);
+    resolve_downscale_buffer_size_ = downscale_buffer_size;
+  }
+  ID3D12Resource* scaled_resolve_buffer = texture_cache_->GetCurrentScaledResolveBufferResource();
+  size_t scaled_resolve_buffer_index = texture_cache_->GetCurrentScaledResolveBufferIndexPublic();
+  if (!scaled_resolve_buffer) {
+    return false;
+  }
+  uint64_t scaled_buffer_base = uint64_t(scaled_resolve_buffer_index) << 30;
+  if (scaled_address < scaled_buffer_base) {
+    return false;
+  }
+  uint64_t source_offset = scaled_address - scaled_buffer_base;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
+  if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
+    return false;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  uint32_t aligned_scaled_length =
+      rex::align(scaled_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+  ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
+                                      scaled_resolve_buffer, aligned_scaled_length,
+                                      source_offset);
+  uint32_t aligned_written_length =
+      rex::align(length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+  ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
+                                      resolve_downscale_buffer_.Get(), aligned_written_length, 0);
+  PushUAVBarrier(scaled_resolve_buffer);
+  texture_cache_->TransitionCurrentScaledResolveRange(
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+  SetExternalPipeline(resolve_downscale_pipeline_.Get());
+  deferred_command_list_.D3DSetComputeRootSignature(resolve_downscale_root_signature_.Get());
+  ResolveDownscaleConstants constants;
+  constants.scale_x = texture_cache_->draw_resolution_scale_x();
+  constants.scale_y = texture_cache_->draw_resolution_scale_y();
+  constants.pixel_size_log2 = pixel_size_log2;
+  constants.tile_count = tile_count;
+  constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
+                                 (constants.scale_x > 1 || constants.scale_y > 1))
+                                    ? 1u
+                                    : 0u;
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(ResolveDownscaleRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
+      &constants, 0);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(ResolveDownscaleRootParameter::kSource), downscale_descriptors[0].second);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(ResolveDownscaleRootParameter::kDestination), downscale_descriptors[1].second);
+  deferred_command_list_.D3DDispatch(tile_count, 1, 1);
+  PushUAVBarrier(resolve_downscale_buffer_.Get());
+  PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(dest, dest_offset, resolve_downscale_buffer_.Get(),
+                                             0, length);
+  PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  SubmitBarriers();
+  return true;
+}
+
+bool D3D12CommandProcessor::CopyResolvedRangeToHost(const LazyResolveRecord& record) {
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  ID3D12Resource* readback = RequestReadbackBuffer(record.length);
+  if (!readback) {
+    return false;
+  }
+  if (record.scaled && texture_cache_->IsDrawResolutionScaled()) {
+    // The resolve went to the scaled resolve buffer: downscale it to the
+    // guest's layout first, as the readback path does.
+    if (!texture_cache_->MakeScaledResolveRangeCurrent(record.address, record.length)) {
+      return false;
+    }
+    if (!DownscaleCurrentScaledResolve(record.length, record.pixel_size_log2, readback, 0)) {
+      return false;
+    }
+  } else {
+    shared_memory_->UseAsCopySource();
+    SubmitBarriers();
+    deferred_command_list_.D3DCopyBufferRegion(readback, 0, shared_memory_->GetBuffer(),
+                                               record.address, record.length);
+  }
+  if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion()) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, record.length};
+  void* mapping = nullptr;
+  if (FAILED(readback->Map(0, &read_range, &mapping)) || !mapping) {
+    return false;
+  }
+  // Through the physical membase, which bypasses the pages' protection.
+  std::memcpy(memory_->TranslatePhysical(record.address), mapping, record.length);
+  D3D12_RANGE written_range = {0, 0};
+  readback->Unmap(0, &written_range);
+  return true;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3443,6 +3850,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    submission_ended_.store(submission_current_ - 1, std::memory_order_release);
 
     submission_open_ = false;
 
