@@ -254,6 +254,7 @@ class BaseHeap {
   // protection, so silently unprotecting here would disable the watch forever.
   // Only PhysicalHeap tracks this; every other heap has no watch state.
   virtual bool IsHostPageWriteWatched(uint32_t host_page_number) const { return false; }
+  virtual bool IsHostPageProviderPending(uint32_t host_page_number) const { return false; }
 
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
@@ -322,6 +323,11 @@ class PhysicalHeap : public BaseHeap {
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
+  // Clears data provider pending flags for a physical range and restores the
+  // protection of its pages (must be called with the global lock held).
+  void ClearDataProviders(uint32_t physical_address, uint32_t length);
+  bool IsHostPageProviderPending(uint32_t host_page_number) const override;
+
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
 
@@ -340,6 +346,9 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Whether the page's contents must be supplied by a data provider before
+    // the guest may read or write it (protected as no-access meanwhile).
+    uint64_t provider_pending;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -501,6 +510,25 @@ class Memory {
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
 
+  // Data providers supply the contents of physical memory the guest is about
+  // to access for the first time since the range was marked as needing them
+  // (with enable_data_providers), for instance the result of a GPU operation
+  // that was not copied back to CPU-visible memory. Called without the global
+  // critical region held, from the thread that touched the memory; writes the
+  // data through the physical membase (which bypasses all protection) and
+  // returns the range it supplied, or false if it has nothing for the range.
+  typedef bool (*PhysicalMemoryDataProviderCallback)(void* context_ptr, uint32_t physical_address,
+                                                     uint32_t length,
+                                                     uint32_t* out_provided_address,
+                                                     uint32_t* out_provided_length);
+  void* RegisterPhysicalMemoryDataProvider(PhysicalMemoryDataProviderCallback callback,
+                                           void* callback_context);
+  void UnregisterPhysicalMemoryDataProvider(void* callback_handle);
+  // Runs the data providers for a physical range and clears the pending flags
+  // of what they supplied. The lock is released around the provider calls.
+  bool ProvidePhysicalMemory(std::unique_lock<std::recursive_mutex>& global_lock,
+                             uint32_t physical_address, uint32_t length);
+
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
   // watched. Must be called with global critical region locking depth of 1.
@@ -624,6 +652,8 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  std::vector<std::pair<PhysicalMemoryDataProviderCallback, void*>*>
+      physical_memory_data_providers_;
 };
 
 }  // namespace rex::memory
