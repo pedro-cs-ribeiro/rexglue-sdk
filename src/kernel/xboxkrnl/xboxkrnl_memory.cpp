@@ -16,12 +16,21 @@
 
 #include <rex/assert.h>
 #include <rex/kernel/xboxkrnl/private.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/thread_state.h>
+#include <rex/system/xthread.h>
+#include <cstdlib>
+#include <string>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_STRING(mem_trace_phys, "", "Kernel",
+                      "Log physical allocations/frees/reads touching <lo_hex>,<hi_hex>");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -344,6 +353,36 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
   return X_STATUS_SUCCESS;
 }
 
+// Diagnostic: trace physical allocations, frees and file reads that touch a
+// physical address range, with guest backtraces (see mem_trace_phys).
+bool PhysTraceHit(uint32_t physical_address, uint32_t size) {
+  static uint32_t lo = 0, hi = 0;
+  static bool parsed = false;
+  if (!parsed) {
+    parsed = true;
+    const std::string spec = REXCVAR_GET(mem_trace_phys);
+    const size_t comma = spec.find(',');
+    if (!spec.empty() && comma != std::string::npos) {
+      lo = static_cast<uint32_t>(std::strtoul(spec.c_str(), nullptr, 16));
+      hi = static_cast<uint32_t>(std::strtoul(spec.c_str() + comma + 1, nullptr, 16));
+    }
+  }
+  if (hi <= lo || physical_address == UINT32_MAX) {
+    return false;
+  }
+  const uint64_t end = static_cast<uint64_t>(physical_address) + size;
+  return physical_address < hi && end > lo;
+}
+
+std::string PhysTraceBacktrace() {
+  if (auto* ts = rex::runtime::ThreadState::Get()) {
+    if (auto* ctx = ts->context()) {
+      return rex::runtime::GuestBacktrace(*ctx, REX_KERNEL_STATE()->memory()->virtual_membase());
+    }
+  }
+  return "?";
+}
+
 u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bits,
                                      u32 min_addr_range, u32 max_addr_range, u32 alignment) {
   REXKRNL_IMPORT_TRACE("MmAllocatePhysicalMemoryEx",
@@ -403,6 +442,15 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
+  if (PhysTraceHit(heap->GetPhysicalAddress(base_address), adjusted_size)) {
+    REXLOG_INFO("[memtrace] MmAllocatePhysicalMemoryEx size={:#x} flags={:#x} protect={:#x} "
+                "min={:#x} max={:#x} align={:#x} -> virt={:#x} phys={:#x} on {}\n{}",
+                (uint32_t)region_size, (uint32_t)flags, (uint32_t)protect_bits,
+                (uint32_t)min_addr_range, (uint32_t)max_addr_range, (uint32_t)alignment,
+                base_address, heap->GetPhysicalAddress(base_address),
+                XThread::GetCurrentThread() ? XThread::GetCurrentThread()->name() : "?",
+                PhysTraceBacktrace());
+  }
 
   return base_address;
 }
@@ -418,6 +466,19 @@ void MmFreePhysicalMemory_entry(u32 type, u32 base_address) {
   assert_true((base_address & 0x1F) == 0);
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
+  {
+    uint32_t traced_size = 0;
+    if (heap && heap->heap_type() == memory::HeapType::kGuestPhysical) {
+      heap->QuerySize(base_address, &traced_size);
+      const uint32_t phys = static_cast<memory::PhysicalHeap*>(heap)->GetPhysicalAddress(base_address);
+      if (PhysTraceHit(phys, traced_size ? traced_size : 1)) {
+        REXLOG_INFO("[memtrace] MmFreePhysicalMemory virt={:#x} phys={:#x} size={:#x} on {}\n{}",
+                    (uint32_t)base_address, phys, traced_size,
+                    XThread::GetCurrentThread() ? XThread::GetCurrentThread()->name() : "?",
+                    PhysTraceBacktrace());
+      }
+    }
+  }
   heap->Release(base_address);
 }
 

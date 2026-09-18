@@ -28,6 +28,14 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+#include <string>
+
+namespace rex::kernel::xboxkrnl {
+
+bool PhysTraceHit(uint32_t physical_address, uint32_t size);
+std::string PhysTraceBacktrace();
+
+}  // namespace rex::kernel::xboxkrnl
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -219,6 +227,18 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
+      }
+      {
+        const uint32_t phys = REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
+        if (PhysTraceHit(phys, buffer_length)) {
+          REXLOG_INFO("[memtrace] NtReadFile {} offset={} len={:#x} -> buf={:#x} phys={:#x} "
+                      "status={:#x} read={:#x} apc={:#x} on {}\n{}",
+                      file->path(), byte_offset_ptr ? (int64_t)byte_offset : -1,
+                      (uint32_t)buffer_length, buffer.guest_address(), phys, (uint32_t)result,
+                      bytes_read, apc_routine_ptr.guest_address(),
+                      XThread::GetCurrentThread() ? XThread::GetCurrentThread()->name() : "?",
+                      PhysTraceBacktrace());
+        }
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
