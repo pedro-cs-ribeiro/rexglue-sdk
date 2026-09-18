@@ -49,11 +49,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = user_profile->xuid();
+        // Online identity.
+        xuid = user_profile->online_xuid();
         result = X_E_SUCCESS;
       } else if (type & 1) {
-        // maybe offline profile?
+        // Offline identity (keys local content).
         xuid = user_profile->xuid();
         result = X_E_SUCCESS;
       }
@@ -89,6 +89,17 @@ static bool LiveEnabled() { return rex::cvar::Query<bool>("live_enabled"); }
 
 // Applies live_gamertag/live_xuid to the profile once and marks it signed in
 // to Live while online play is enabled.
+// A stable online XUID for a gamertag, so distinct players get distinct
+// identities without one being configured. FNV-1a of the tag, kept clear of
+// the forbidden 0x00C0.. permission mask and given a Live-looking prefix.
+static uint64_t OnlineXuidFromGamertag(const std::string& tag) {
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (unsigned char c : tag) {
+    hash = (hash ^ c) * 0x100000001B3ull;
+  }
+  return 0x0009000000000000ull | (hash & 0x00000FFFFFFFFFFFull);
+}
+
 static void SyncLiveIdentity() {
   auto* profile = REX_KERNEL_STATE()->user_profile();
   if (!profile) {
@@ -101,11 +112,15 @@ static void SyncLiveIdentity() {
   if (tag != applied_tag || xuid_text != applied_xuid) {
     applied_tag = tag;
     applied_xuid = xuid_text;
-    uint64_t xuid = profile->xuid();
+    uint64_t online_xuid;
     if (!xuid_text.empty()) {
-      xuid = std::strtoull(xuid_text.c_str(), nullptr, 16);
+      online_xuid = std::strtoull(xuid_text.c_str(), nullptr, 16);
+    } else if (!tag.empty()) {
+      online_xuid = OnlineXuidFromGamertag(tag);
+    } else {
+      online_xuid = profile->xuid();
     }
-    profile->SetIdentity(xuid, tag.empty() ? profile->name() : tag);
+    profile->SetOnlineIdentity(online_xuid, tag.empty() ? profile->name() : tag);
   }
   profile->set_signin_state(LiveEnabled() ? REXCVAR_GET(live_signin_state) : 1);
 }
@@ -144,7 +159,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   SyncLiveIdentity();
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = user_profile->xuid();
+  info->xuid = user_profile->online_xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
@@ -203,7 +218,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     assert_not_null(xuids);
     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+    // The game may pass either the offline (content) or the online XUID.
+    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid() ||
+                static_cast<uint64_t>(xuids[0]) == user_profile->online_xuid());
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;

@@ -216,7 +216,12 @@ class UserProfile {
 
   UserProfile();
 
+  // The console/offline XUID keys local content (saves), so it stays fixed
+  // regardless of which online account is signed in. The online XUID is the
+  // identity other players and the server see; it may be set from a host's
+  // account store and defaults to the offline one.
   uint64_t xuid() const { return xuid_; }
+  uint64_t online_xuid() const { return online_xuid_ ? online_xuid_ : xuid_; }
   std::string name() const { return name_; }
   // 0 = signed out, 1 = local profile, 2 = signed in to Live.
   uint32_t signin_state() const { return signin_state_; }
@@ -228,6 +233,13 @@ class UserProfile {
     xuid_ = xuid;
     name_ = std::move(name);
   }
+
+  // Sets only the online identity, leaving the content/offline XUID alone so
+  // local saves are still found.
+  void SetOnlineIdentity(uint64_t xuid, std::string name) {
+    online_xuid_ = xuid;
+    name_ = std::move(name);
+  }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
@@ -237,6 +249,7 @@ class UserProfile {
 
  private:
   uint64_t xuid_;
+  uint64_t online_xuid_ = 0;
   std::string name_;
   uint32_t signin_state_ = 1;
   std::vector<std::unique_ptr<Setting>> setting_list_;
