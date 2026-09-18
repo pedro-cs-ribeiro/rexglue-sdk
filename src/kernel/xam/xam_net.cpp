@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <mutex>
+#include <random>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -200,6 +202,8 @@ REXCVAR_DEFINE_UINT32(live_service_port, 42124, "Live",
 REXCVAR_DEFINE_BOOL(live_trace, false, "Live", "Log every online-related kernel call")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Diagnostics: report the console as online (title address, link status).
+REXCVAR_DEFINE_UINT32(live_relay_port, 10043, "Live",
+                      "UDP port of the server's peer relay for match traffic");
 REXCVAR_DEFINE_BOOL(live_report_online, true, "Live",
                     "Report an online title address and an active link while online play is enabled")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -337,6 +341,188 @@ static uint32_t LiveServerNBO() {
 
 static bool LiveTrace() { return REXCVAR_GET(live_enabled) && REXCVAR_GET(live_trace); }
 
+// ---------------------------------------------------------------------------
+// Peer relay. Titles address other consoles by XNADDR and talk to them over
+// secure UDP; here every console carries a 64-bit relay id in its XNADDR
+// (abOnline[0..8]), each peer id maps to a private address (10.77.x.y), and
+// datagrams to such an address are wrapped in a relay frame and sent to the
+// server's relay port, which forwards them to the peer. Incoming frames are
+// unwrapped and presented as coming from the peer's private address, so the
+// title's sockets never see the difference.
+namespace relay {
+
+constexpr size_t kHeaderSize = 24;  // "FSR1", src id, dst id, src port, dst port
+constexpr uint32_t kPrefix = 0x0A4D0000;  // 10.77.0.0/16, host order
+
+struct Peer {
+  uint64_t id;
+  uint32_t ina;  // network order
+};
+
+static std::mutex g_mutex;
+static std::vector<Peer> g_peers;
+static std::vector<std::pair<uint64_t, uint16_t>> g_bound;  // native handle, port (host order)
+static uint64_t g_own_id = 0;
+static bool g_keepalive_started = false;
+
+static uint64_t OwnId() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_own_id) {
+    // The console identity when one is configured, otherwise a random id for
+    // this process; peers learn it through the server anyway.
+    const std::string xuid = rex::cvar::Query<std::string>("live_xuid");
+    if (!xuid.empty()) {
+      g_own_id = std::strtoull(xuid.c_str(), nullptr, 16);
+    }
+    if (!g_own_id) {
+      std::random_device rd;
+      g_own_id = (static_cast<uint64_t>(rd()) << 32) | rd();
+      if (!g_own_id) g_own_id = 1;
+    }
+  }
+  return g_own_id;
+}
+
+static bool IsRelayAddr(uint32_t ina_nbo) { return (ntohl(ina_nbo) & 0xFFFF0000u) == kPrefix; }
+
+// Private address for a peer id, allocated on first sight.
+static uint32_t InAddrFor(uint64_t id) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (const auto& peer : g_peers) {
+    if (peer.id == id) return peer.ina;
+  }
+  const uint32_t n = static_cast<uint32_t>(g_peers.size() + 1) & 0xFFFF;
+  const uint32_t ina = htonl(kPrefix | n);
+  g_peers.push_back(Peer{id, ina});
+  return ina;
+}
+
+static bool IdFor(uint32_t ina_nbo, uint64_t* id) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (const auto& peer : g_peers) {
+    if (peer.ina == ina_nbo) {
+      *id = peer.id;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void Put64(uint8_t* p, uint64_t v) {
+  for (int i = 7; i >= 0; --i) {
+    p[i] = static_cast<uint8_t>(v);
+    v >>= 8;
+  }
+}
+static uint64_t Get64(const uint8_t* p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+  return v;
+}
+
+static void WriteHeader(uint8_t* p, uint64_t src, uint64_t dst, uint16_t sport, uint16_t dport) {
+  p[0] = 'F'; p[1] = 'S'; p[2] = 'R'; p[3] = '1';
+  Put64(p + 4, src);
+  Put64(p + 12, dst);
+  p[20] = static_cast<uint8_t>(sport >> 8); p[21] = static_cast<uint8_t>(sport);
+  p[22] = static_cast<uint8_t>(dport >> 8); p[23] = static_cast<uint8_t>(dport);
+}
+
+static bool ParseHeader(const uint8_t* p, size_t len, uint64_t* src, uint64_t* dst,
+                        uint16_t* sport, uint16_t* dport) {
+  if (len < kHeaderSize || p[0] != 'F' || p[1] != 'S' || p[2] != 'R' || p[3] != '1') return false;
+  *src = Get64(p + 4);
+  *dst = Get64(p + 12);
+  *sport = static_cast<uint16_t>((p[20] << 8) | p[21]);
+  *dport = static_cast<uint16_t>((p[22] << 8) | p[23]);
+  return true;
+}
+
+static sockaddr_in ServerEndpoint() {
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = LiveServerNBO();
+  sa.sin_port = htons(static_cast<uint16_t>(REXCVAR_GET(live_relay_port)));
+  return sa;
+}
+
+static bool FromServer(const N_XSOCKADDR_IN& from) {
+  return from.sin_addr == LiveServerNBO() &&
+         static_cast<uint16_t>(from.sin_port) == static_cast<uint16_t>(REXCVAR_GET(live_relay_port));
+}
+
+// A header-only frame tells the server which endpoint serves this console's
+// port, so peers can reach a socket before it has sent anything itself.
+static void Hello(uint64_t native_handle, uint16_t port) {
+  uint8_t frame[kHeaderSize];
+  WriteHeader(frame, OwnId(), 0, port, 0);
+  const sockaddr_in to = ServerEndpoint();
+  ::sendto(static_cast<SOCKET>(native_handle), reinterpret_cast<const char*>(frame),
+           static_cast<int>(sizeof(frame)), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+static void RegisterBound(uint64_t native_handle, uint16_t port) {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_bound.emplace_back(native_handle, port);
+    if (!g_keepalive_started) {
+      g_keepalive_started = true;
+      std::thread([] {
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::seconds(10));
+          std::vector<std::pair<uint64_t, uint16_t>> bound;
+          {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            bound = g_bound;
+          }
+          for (const auto& entry : bound) Hello(entry.first, entry.second);
+        }
+      }).detach();
+    }
+  }
+  Hello(native_handle, port);
+}
+
+static void UnregisterBound(uint64_t native_handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (auto it = g_bound.begin(); it != g_bound.end();) {
+    it = it->first == native_handle ? g_bound.erase(it) : it + 1;
+  }
+}
+
+// Wraps a datagram for a peer address and sends it to the server. Returns
+// the payload length the title expects, or -1.
+static int SendTo(XSocket* socket, const uint8_t* buf, uint32_t len, const N_XSOCKADDR_IN& to) {
+  uint64_t dst = 0;
+  if (!IdFor(to.sin_addr, &dst)) return -1;
+  std::vector<uint8_t> frame(kHeaderSize + len);
+  WriteHeader(frame.data(), OwnId(), dst, socket->bound_port(), static_cast<uint16_t>(to.sin_port));
+  std::memcpy(frame.data() + kHeaderSize, buf, len);
+  const sockaddr_in server = ServerEndpoint();
+  const int sent = ::sendto(static_cast<SOCKET>(socket->native_handle()),
+                            reinterpret_cast<const char*>(frame.data()),
+                            static_cast<int>(frame.size()), 0,
+                            reinterpret_cast<const sockaddr*>(&server), sizeof(server));
+  return sent < 0 ? -1 : static_cast<int>(len);
+}
+
+// Unwraps a frame received from the server in place: the payload moves to
+// the buffer start and the source becomes the peer's private address.
+// Header-only frames (server keepalives) leave nothing to deliver.
+static void TranslateIncoming(uint8_t* buf, int* ret, N_XSOCKADDR_IN* from) {
+  if (*ret < 0 || !from || !FromServer(*from)) return;
+  uint64_t src, dst;
+  uint16_t sport, dport;
+  if (!ParseHeader(buf, static_cast<size_t>(*ret), &src, &dst, &sport, &dport)) return;
+  const int payload = *ret - static_cast<int>(kHeaderSize);
+  std::memmove(buf, buf + kHeaderSize, static_cast<size_t>(payload));
+  from->sin_addr = InAddrFor(src);
+  from->sin_port = sport;
+  *ret = payload;
+}
+
+}  // namespace relay
+
 // Overlapped receives. Winsock semantics: return 0 with the byte count when
 // data is available at once (the overlapped structure and its event are still
 // completed), otherwise -1 with WSA_IO_PENDING and completion later, which a
@@ -381,6 +567,17 @@ static int PerformWsaRecv(XSocket* socket, const WsaRecvRequest& req, int* error
     N_XSOCKADDR_IN native_from;
     uint32_t native_fromlen = sizeof(native_from);
     ret = socket->RecvFrom(buf, len, 0, &native_from, &native_fromlen);
+    if (REXCVAR_GET(live_enabled) && ret > 0) {
+      relay::TranslateIncoming(buf, &ret, &native_from);
+      if (ret == 0) {
+        ret = -1;  // keepalive from the relay: keep waiting
+#if REX_PLATFORM_WIN32
+        WSASetLastError(WSAEWOULDBLOCK);
+#else
+        errno = EWOULDBLOCK;
+#endif
+      }
+    }
     if (ret >= 0 && req.from_guest) {
       auto* from = memory->TranslateVirtual<XSOCKADDR_IN*>(req.from_guest);
       from->sin_family = native_from.sin_family;
@@ -693,6 +890,13 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   std::memset(addr_ptr->abEnet, 0xCC, 6);
 
   std::memset(addr_ptr->abOnline, 0, 20);
+  if (REXCVAR_GET(live_enabled)) {
+    // The relay id: peers map it to a private address (see relay::).
+    const uint64_t id = relay::OwnId();
+    relay::Put64(addr_ptr->abOnline, id);
+    std::memcpy(addr_ptr->abEnet, addr_ptr->abOnline + 2, 6);
+    addr_ptr->abEnet[0] = static_cast<uint8_t>((addr_ptr->abEnet[0] | 0x02) & 0xFE);  // local, unicast
+  }
 
   if (REXCVAR_GET(live_enabled) && REXCVAR_GET(live_report_online)) {
     // Online: a routable-looking address with gateway and DNS, which is what
@@ -728,13 +932,16 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
   if (REXCVAR_GET(live_enabled)) {
-    // Every secure peer address resolves to the server, which relays traffic.
-    const uint32_t redirect = LiveServerNBO();
+    // A peer's XNADDR carries its relay id; it gets a private address that
+    // the datagram paths route through the server's relay. Addresses
+    // without an id (older peers, servers) resolve to the server itself.
+    const uint64_t id = xn_addr ? relay::Get64(xn_addr->abOnline) : 0;
+    const uint32_t redirect = id ? relay::InAddrFor(id) : LiveServerNBO();
     if (in_addr) {
       std::memcpy(in_addr.host_address(), &redirect, sizeof(redirect));
     }
     if (LiveTrace()) {
-      REXKRNL_INFO("[live] XNetXnAddrToInAddr -> server");
+      REXKRNL_INFO("[live] XNetXnAddrToInAddr id={:#x} -> {:#x}", id, ntohl(redirect));
     }
     return 0;
   }
@@ -822,9 +1029,25 @@ u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey)
 
 // Does the reverse of the above.
 // FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
-  return 1;
+  uint64_t id = 0;
+  if (!REXCVAR_GET(live_enabled) || !relay::IsRelayAddr(in_addr) || !relay::IdFor(in_addr, &id)) {
+    return 1;
+  }
+  if (xn_addr) {
+    xn_addr.Zero();
+    xn_addr->ina.s_addr = in_addr;
+    xn_addr->inaOnline.s_addr = in_addr;
+    xn_addr->wPortOnline = htons(3074);
+    relay::Put64(xn_addr->abOnline, id);
+    std::memcpy(xn_addr->abEnet, xn_addr->abOnline + 2, 6);
+    xn_addr->abEnet[0] = static_cast<uint8_t>((xn_addr->abEnet[0] | 0x02) & 0xFE);
+  }
+  if (xid) {
+    std::memset(xid.host_address(), 0, 8);
+  }
+  return 0;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
@@ -1024,6 +1247,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
     XThread::SetLastError(0x2736);
     return -1;
   }
+  relay::UnregisterBound(socket->native_handle());
 
   // TODO: Absolutely delete this object. It is no longer valid after calling
   // closesocket.
@@ -1104,6 +1328,16 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
+  }
+  if (REXCVAR_GET(live_enabled)) {
+    int type = 0;
+    int type_len = sizeof(type);
+    if (getsockopt(static_cast<SOCKET>(socket->native_handle()), SOL_SOCKET, SO_TYPE,
+                   reinterpret_cast<char*>(&type), &type_len) == 0 &&
+        type == SOCK_DGRAM) {
+      // Announce this port to the peer relay so other consoles can reach it.
+      relay::RegisterBound(socket->native_handle(), socket->bound_port());
+    }
   }
 
   return 0;
@@ -1422,6 +1656,14 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
+  if (REXCVAR_GET(live_enabled) && ret > 0) {
+    relay::TranslateIncoming(buf_ptr, &ret, &native_from);
+    if (ret == 0) {
+      // A relay keepalive: nothing for the title.
+      XThread::SetLastError(0x2733);  // WSAEWOULDBLOCK
+      return -1;
+    }
+  }
 
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
@@ -1471,6 +1713,14 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
+  if (REXCVAR_GET(live_enabled) && relay::IsRelayAddr(native_to.sin_addr)) {
+    const int sent = relay::SendTo(socket.get(), buf_ptr, buf_len, native_to);
+    if (sent < 0) {
+      XThread::SetLastError(0x2751);  // WSAEHOSTUNREACH
+      return -1;
+    }
+    return sent;
+  }
   return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
 }
 
