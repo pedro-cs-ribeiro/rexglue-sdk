@@ -11,7 +11,13 @@
 
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/thread.h>
+
+#include <algorithm>
+#include <mutex>
+#include <vector>
 
 namespace rex {
 namespace kernel {
@@ -20,6 +26,21 @@ using namespace rex::system;
 using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
+
+namespace {
+// Users joined to the title's session(s) via XSessionJoinLocal/JoinRemote, in
+// join order. Every session object resolves to the same fake pointer, so one
+// list stands for all of them: for a 1v1 that is exactly the arbitration set.
+std::mutex g_session_lock;
+std::vector<uint64_t> g_session_users;
+
+void AddSessionUser(uint64_t xuid) {
+  if (!xuid) return;
+  std::lock_guard<std::mutex> lock(g_session_lock);
+  if (std::find(g_session_users.begin(), g_session_users.end(), xuid) == g_session_users.end())
+    g_session_users.push_back(xuid);
+}
+}  // namespace
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
@@ -113,6 +134,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+      {
+        std::lock_guard<std::mutex> lock(g_session_lock);
+        g_session_users.clear();
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -123,7 +148,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
-
+      {
+        std::lock_guard<std::mutex> lock(g_session_lock);
+        g_session_users.clear();
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0012: {
@@ -138,6 +166,21 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                     is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
+      for (uint32_t i = 0; i < user_count && i < 8; i++) {
+        uint64_t xuid = 0;
+        if (is_local) {
+          auto* indices = user_index_array ? memory_->TranslateVirtual(user_index_array) : nullptr;
+          uint32_t user_index = indices ? memory::load_and_swap<uint32_t>(indices + i * 4) : 0;
+          if (auto* profile = REX_KERNEL_STATE()->user_profile()) {
+            (void)user_index;
+            xuid = profile->online_xuid();
+          }
+        } else if (xuid_array_ptr) {
+          xuid = memory::load_and_swap<uint64_t>(memory_->TranslateVirtual(xuid_array_ptr) + i * 8);
+        }
+        AddSessionUser(xuid);
+        REXKRNL_INFO("[xgi] session {} user {:016X}", is_local ? "local" : "remote", xuid);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
@@ -271,6 +314,44 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     obj_ptr, flags, session_nonce, session_duration_sec, results_buffer_size,
                     results_ptr);
 
+      // Arbitrated sessions: every console registers with Live and reads back
+      // the list of registrants; the title keeps re-registering (5 x 1 s) until
+      // the list is complete and drops the whole peer mesh otherwise. There is
+      // no Live here, so report every user joined to the session, one machine
+      // per user. Layout (big-endian, guest pointers):
+      //   XSESSION_REGISTRATION_RESULTS { u32 wNumRegistrants; XSESSION_REGISTRANT* rgRegistrants; }
+      //   XSESSION_REGISTRANT { u64 qwMachineID; u32 bTrustworthiness; u32 bNumUsers; XUID* rgUsers; } (24 B)
+      std::vector<uint64_t> users;
+      {
+        std::lock_guard<std::mutex> lock(g_session_lock);
+        users = g_session_users;
+      }
+      if (users.empty()) {
+        if (auto* profile = REX_KERNEL_STATE()->user_profile()) users.push_back(profile->online_xuid());
+      }
+      const uint32_t n = static_cast<uint32_t>(users.size());
+      const uint32_t need = 8 + n * 24 + n * 8;
+      if (results_ptr && results_buffer_size >= need) {
+        auto* out = memory_->TranslateVirtual(results_ptr);
+        std::memset(out, 0, results_buffer_size);
+        const uint32_t regs_ptr = results_ptr + 8;
+        const uint32_t xuids_ptr = regs_ptr + n * 24;
+        memory::store_and_swap<uint32_t>(out + 0, n);
+        memory::store_and_swap<uint32_t>(out + 4, regs_ptr);
+        for (uint32_t i = 0; i < n; i++) {
+          auto* reg = out + 8 + i * 24;
+          memory::store_and_swap<uint64_t>(reg + 0, 0xFA00000000000000ull | (users[i] & 0x0000FFFFFFFFFFFFull));
+          memory::store_and_swap<uint32_t>(reg + 8, 1);   // trustworthy
+          memory::store_and_swap<uint32_t>(reg + 12, 1);  // one user per machine
+          memory::store_and_swap<uint32_t>(reg + 16, xuids_ptr + i * 8);
+          memory::store_and_swap<uint64_t>(out + 8 + n * 24 + i * 8, users[i]);
+        }
+        REXKRNL_INFO("[xgi] XSessionArbitrationRegister: {} registrants ({} bytes of {})", n, need,
+                     results_buffer_size);
+      } else {
+        REXKRNL_WARN("[xgi] XSessionArbitrationRegister: results buffer {:08X} size {} < {} needed",
+                     results_ptr, results_buffer_size, need);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B001B: {
