@@ -23,6 +23,7 @@ set(REXKERNEL_SOURCES
     xam/xam_video.cpp
     xam/xam_voice.cpp
     xam/xam_misc.cpp
+    xam/fifa_friend_net.cpp
     xam/apps/xam_app.cpp
     xam/apps/xgi_app.cpp
     xam/apps/xlivebase_app.cpp

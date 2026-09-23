@@ -9,6 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <mutex>
+#include <set>
+#include <thread>
+
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -28,6 +34,8 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+#include "fifa_friends.h"
 
 namespace rex {
 namespace kernel {
@@ -560,6 +568,193 @@ uint32_t XamShowMessageBoxUIEx_entry() {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// FIFA Street: the "invite a friend" blade (RS in Play with Friends). On real
+// hardware this opens the Xbox friends UI and the blade sends the invite; there
+// is no Xbox Live here, so we present our own picker of who is online on the
+// FIFA Street server and ask the server to deliver the invite.
+
+class FriendPickerDialog : public XamDialog {
+ public:
+  FriendPickerDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::vector<FriendEntry> friends)
+      : XamDialog(imgui_drawer), friends_(std::move(friends)) {}
+
+  // Index into the friend list that was invited, or -1 if cancelled.
+  int chosen() const { return chosen_; }
+
+  void OnDraw(ImGuiIO& io) override {
+    if (!has_opened_) {
+      ImGui::OpenPopup("Invite a Friend");
+      has_opened_ = true;
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Invite a Friend", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::SetWindowFontScale(1.6f);
+      if (friends_.empty()) {
+        ImGui::Text("No friends are online right now.");
+        ImGui::Spacing();
+      } else {
+        // Pre-select the first friend so Invite is immediately actionable
+        // (one click / one confirm) instead of requiring a select-then-invite.
+        if (selected_ < 0 || selected_ >= static_cast<int>(friends_.size())) {
+          selected_ = 0;
+        }
+        ImGui::Text("Select a friend to invite to your game:");
+        ImGui::Separator();
+        for (size_t i = 0; i < friends_.size(); ++i) {
+          if (ImGui::Selectable(friends_[i].name.c_str(), selected_ == static_cast<int>(i))) {
+            selected_ = static_cast<int>(i);
+          }
+        }
+        ImGui::Separator();
+        // Enter/keypad-Enter confirms the highlighted friend (in addition to the
+        // Invite button), so the blade is completable by keyboard/controller.
+        const bool confirm_key =
+            ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+        if (ImGui::Button("Invite") || confirm_key) {
+          chosen_ = selected_;
+          ImGui::CloseCurrentPopup();
+          Close();
+        }
+        ImGui::SameLine();
+      }
+      if (ImGui::Button("Cancel")) {
+        chosen_ = -1;
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+      ImGui::EndPopup();
+    } else {
+      Close();
+    }
+  }
+
+ private:
+  bool has_opened_ = false;
+  int selected_ = -1;
+  int chosen_ = -1;
+  std::vector<FriendEntry> friends_;
+};
+
+u32 XamShowFriendsUI_entry(u32 user_index) {
+  auto* profile = REX_KERNEL_STATE()->user_profile();
+  const uint64_t self_xuid = profile ? profile->online_xuid() : 0;
+  std::vector<FriendEntry> friends = FsrFetchPlayers(self_xuid);
+
+  const Runtime* emulator = REX_KERNEL_STATE()->emulator();
+  ui::ImGuiDrawer* imgui_drawer = emulator ? emulator->imgui_drawer() : nullptr;
+  if (!imgui_drawer || REXCVAR_GET(headless)) {
+    return X_ERROR_SUCCESS;  // no UI surface; nothing to show
+  }
+
+  uint32_t invite_to = 0;
+  auto close = [&invite_to, &friends](FriendPickerDialog* dialog) -> X_RESULT {
+    int c = dialog->chosen();
+    if (c >= 0 && c < static_cast<int>(friends.size())) {
+      invite_to = friends[c].id;
+    }
+    return X_ERROR_SUCCESS;
+  };
+  // Synchronous (overlapped = 0): blocks this thread while the picker is up,
+  // which also stops the game from re-opening it every frame.
+  xeXamDispatchDialog<FriendPickerDialog>(new FriendPickerDialog(imgui_drawer, friends), close, 0);
+  if (invite_to != 0) {
+    REXKRNL_INFO("XamShowFriendsUI: inviting player {} to the game", invite_to);
+    FsrSendInvite(self_xuid, invite_to);
+  }
+  return X_ERROR_SUCCESS;
+}
+
+// The prompt the invitee sees when a friend invites them.
+class InviteReceiveDialog : public XamDialog {
+ public:
+  InviteReceiveDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string from_name)
+      : XamDialog(imgui_drawer), from_name_(std::move(from_name)) {}
+
+  bool accepted() const { return accepted_; }
+
+  void OnDraw(ImGuiIO& io) override {
+    if (!has_opened_) {
+      ImGui::OpenPopup("Game Invite");
+      has_opened_ = true;
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Game Invite", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::SetWindowFontScale(1.6f);
+      ImGui::Text("%s invited you to their game.", from_name_.c_str());
+      ImGui::Spacing();
+      ImGui::Separator();
+      if (ImGui::Button("Accept")) {
+        accepted_ = true;
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Decline")) {
+        accepted_ = false;
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+      ImGui::EndPopup();
+    } else {
+      Close();
+    }
+  }
+
+ private:
+  bool has_opened_ = false;
+  bool accepted_ = false;
+  std::string from_name_;
+};
+
+namespace {
+
+void InvitePollLoop() {
+  std::set<uint32_t> handled;
+  for (;;) {
+    rex::thread::Sleep(std::chrono::seconds(3));
+    if (rex::cvar::GetFlagByName("live_enabled") != "true") {
+      continue;
+    }
+    auto* profile = REX_KERNEL_STATE()->user_profile();
+    if (!profile) {
+      continue;
+    }
+    const uint64_t self_xuid = profile->online_xuid();
+    for (const auto& inv : FsrFetchInvites(self_xuid)) {
+      if (!handled.insert(inv.from_id).second) {
+        continue;  // already prompted for this inviter
+      }
+      const Runtime* emulator = REX_KERNEL_STATE()->emulator();
+      ui::ImGuiDrawer* imgui_drawer = emulator ? emulator->imgui_drawer() : nullptr;
+      if (!imgui_drawer || REXCVAR_GET(headless)) {
+        continue;
+      }
+      REXKRNL_INFO("received game invite from {}", inv.from_name);
+      bool accepted = false;
+      auto close = [&accepted](InviteReceiveDialog* dialog) -> X_RESULT {
+        accepted = dialog->accepted();
+        return X_ERROR_SUCCESS;
+      };
+      xeXamDispatchDialog<InviteReceiveDialog>(
+          new InviteReceiveDialog(imgui_drawer, inv.from_name), close, 0);
+      if (accepted) {
+        REXKRNL_INFO("accepted invite from {}; joining game", inv.from_name);
+        FsrAccept(self_xuid, inv.from_id);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+void StartInvitePollThread() {
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(InvitePollLoop).detach(); });
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -609,7 +804,7 @@ REX_EXPORT_STUB(__imp__XamShowFitnessWarnAboutTimeUI);
 REX_EXPORT_STUB(__imp__XamShowFofUI);
 REX_EXPORT_STUB(__imp__XamShowForcedNameChangeUI);
 REX_EXPORT_STUB(__imp__XamShowFriendRequestUI);
-REX_EXPORT_STUB(__imp__XamShowFriendsUI);
+REX_EXPORT(__imp__XamShowFriendsUI, rex::kernel::xam::XamShowFriendsUI_entry);
 REX_EXPORT_STUB(__imp__XamShowFriendsUIp);
 REX_EXPORT_STUB(__imp__XamShowGameInviteUI);
 REX_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);

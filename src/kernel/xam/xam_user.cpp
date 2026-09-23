@@ -28,6 +28,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "fifa_friends.h"
+
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
 namespace rex {
@@ -123,6 +125,10 @@ static void SyncLiveIdentity() {
     profile->SetOnlineIdentity(online_xuid, tag.empty() ? profile->name() : tag);
   }
   profile->set_signin_state(LiveEnabled() ? REXCVAR_GET(live_signin_state) : 1);
+  if (LiveEnabled()) {
+    // Once we are online, watch for game invites in the background.
+    StartInvitePollThread();
+  }
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
