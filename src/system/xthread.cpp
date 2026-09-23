@@ -899,7 +899,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // SetActiveCpu runs on every guest thread reschedule; on <6-core hosts (e.g.
+    // a GPU-P VM given 4 vCPUs) this warning floods and rotates the log away.
+    // Warn once - the behaviour (skip affinity pinning) is unchanged.
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      REXSYS_WARN("Too few processor cores (<6) - thread affinity pinning disabled");
+    }
   }
 }
 

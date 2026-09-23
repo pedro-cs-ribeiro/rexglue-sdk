@@ -37,6 +37,15 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
+    case 0x0005000C: {
+      // XStringVerify / content filter (FilterText): the title checks player
+      // strings against the offensive-word service before an online match.
+      // We run no filter, so approve everything: the result buffer is an array
+      // of per-string HRESULTs (all S_OK = allowed). arg block layout is small
+      // and title-specific, so just succeed - the title proceeds with the text.
+      REXKRNL_DEBUG("XLiveBaseStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
     case 0x00058004: {
       // Called on startup, seems to just return a bool in the buffer.
       assert_true(!buffer_length || buffer_length == 4);
@@ -106,6 +115,14 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
     }
     case 0x00058037: {
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
+    case 0x0005800E: {
+      // Called ~2.5 min into an online match's Side Select once BOTH players are
+      // ready, as part of the match-start/session-finalize; the default X_E_FAIL
+      // aborts the start and drops the ready (match never kicks off). Both args
+      // are guest pointers (in/out structs); succeed and leave the output as-is.
+      REXKRNL_DEBUG("XLiveBaseUnk5800E({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
   }

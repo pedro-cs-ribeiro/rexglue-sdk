@@ -12,6 +12,13 @@
 #include <rex/logging.h>
 #include <rex/hook.h>
 
+// FIFA Street asks the logon layer for the title id while setting up an online
+// match; a 0 from the stub leaves the prematch/side-select path with a null and
+// it faults. Return the real title id (0x4541097B).
+static uint32_t XNetLogonGetTitleID_entry() {
+  return 0x4541097Bu;
+}
+
 // kinda gross but oh well
 REX_EXPORT_STUB(__imp__CancelWaitableTimer);
 REX_EXPORT_STUB(__imp__ControlPackGetCursorPosition);
@@ -243,7 +250,7 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+REX_EXPORT(__imp__XNetLogonGetTitleID, XNetLogonGetTitleID_entry);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);

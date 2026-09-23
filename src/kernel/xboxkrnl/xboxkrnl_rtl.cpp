@@ -416,16 +416,19 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
             chain = rex::runtime::GuestBacktrace(*ctx, REX_KERNEL_STATE()->memory()->virtual_membase());
           }
         }
+        // Read owning_thread ONCE: another thread's Leave can zero it between
+        // reads, and TranslateVirtual(0) then faults inside GetNativeObject.
+        const uint32_t owner_tid = static_cast<uint32_t>(cs->owning_thread);
         std::string owner = "?";
-        if (cs->owning_thread) {
+        if (owner_tid) {
           auto thread = XObject::GetNativeObject<XThread>(
-              REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(cs->owning_thread));
+              REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(owner_tid));
           if (thread) {
             owner = fmt::format("{} (guest tid {})", thread->name(), thread->thread_id());
           }
         }
         REXKRNL_INFO("[crit] blocking on cs={:#x} owner={:#x} = {}; backtrace:{}", cs.guest_address(),
-                     static_cast<uint32_t>(cs->owning_thread), owner, chain);
+                     owner_tid, owner, chain);
       }
     }
     // Create a full waiter.

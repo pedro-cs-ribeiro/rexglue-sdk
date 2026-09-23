@@ -1325,7 +1325,17 @@ bool BaseHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type
   // 0x3XXXXXXX is for system threads, 0x7XXXXXXX is for title threads.
   uint32_t heap_virtual_guest_offset = 0;
   if (heap_type_ == memory::HeapType::kGuestVirtual) {
-    heap_virtual_guest_offset = 0x10000000;
+    // Reserve the top of each 4K guest-virtual heap for the system heap (kernel
+    // objects / thread stacks). Bumped 0x10000000 (256MB) -> 0x18000000 (384MB)
+    // -> 0x20000000 (512MB): an online P2P match leaks system-heap objects while
+    // it sits in the pre-game Side Select (a per-frame BuildGameSetupUserList
+    // allocation), so give it more headroom from the lightly-used normal region
+    // below it to survive long enough for the side assignment to complete. The
+    // 64K heap is unchanged. Kept at 0x20000000 (512MB): the online pre-game
+    // leaks system-heap while it sits at Side Select, so give it headroom; a
+    // larger 0x28000000 (640MB) shrinks the normal region too far and does not
+    // help because the joiner leaves at the ~5-min pre-game timeout, not the leak.
+    heap_virtual_guest_offset = 0x20000000;
     if (page_size_ == 0x10000) {
       heap_virtual_guest_offset = 0x0F000000;
     }
@@ -1345,7 +1355,10 @@ bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t alloc
 
   uint32_t low_address = heap_base_;
   if (heap_type_ == memory::HeapType::kGuestVirtual) {
-    low_address = heap_base_ + heap_size_ - 0x10000000;
+    // Match Alloc()'s per-page-size system-heap reservation (4K: 0x20000000,
+    // 64K: 0x0F000000) so the system and normal regions stay consistent.
+    uint32_t sys_offset = (page_size_ == 0x10000) ? 0x0F000000 : 0x20000000;
+    low_address = heap_base_ + heap_size_ - sys_offset;
   }
   uint32_t high_address = heap_base_ + (heap_size_ - 1);
   return AllocRange(low_address, high_address, size, alignment, allocation_type, protect, top_down,
