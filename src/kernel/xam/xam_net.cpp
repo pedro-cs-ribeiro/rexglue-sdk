@@ -364,6 +364,12 @@ static std::vector<Peer> g_peers;
 static std::vector<std::pair<uint64_t, uint16_t>> g_bound;  // native handle, port (host order)
 static uint64_t g_own_id = 0;
 static bool g_keepalive_started = false;
+// The exact address:port the title last sent a localhost P2P datagram to. The
+// title expects replies from that same sockaddr, so incoming relayed datagrams
+// are presented as coming from it (byte-for-byte), sidestepping any host/network
+// byte-order differences in the sockaddr fields. Fine for a 1v1 (one peer).
+static uint32_t g_p2p_addr = 0;
+static uint16_t g_p2p_port = 0;
 
 static uint64_t OwnId() {
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -447,8 +453,15 @@ static sockaddr_in ServerEndpoint() {
 }
 
 static bool FromServer(const N_XSOCKADDR_IN& from) {
-  return from.sin_addr == LiveServerNBO() &&
-         static_cast<uint16_t>(from.sin_port) == static_cast<uint16_t>(REXCVAR_GET(live_relay_port));
+  // The recv path presents sin_addr/sin_port in host byte order while the server
+  // helpers are network order, so accept either the value or its byte-swap for
+  // both fields.
+  const uint32_t a = static_cast<uint32_t>(from.sin_addr);
+  const uint32_t sv = LiveServerNBO();
+  if (a != sv && a != ntohl(sv)) return false;
+  const uint16_t p = static_cast<uint16_t>(from.sin_port);
+  const uint16_t relay_port = static_cast<uint16_t>(REXCVAR_GET(live_relay_port));
+  return p == relay_port || p == static_cast<uint16_t>((relay_port >> 8) | (relay_port << 8));
 }
 
 // A header-only frame tells the server which endpoint serves this console's
@@ -490,13 +503,65 @@ static void UnregisterBound(uint64_t native_handle) {
   }
 }
 
+// The port this socket announces to the relay. It is the port the title asked
+// to bind, which may differ from the socket's actual host port when a second
+// local instance had to fall back to an ephemeral bind (the title's port was
+// already held). Peer addressing is keyed on (relay id, this port), so it must
+// stay the title's port for both instances to reach each other.
+static uint16_t AnnouncedPort(uint64_t native_handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (const auto& entry : g_bound) {
+    if (entry.first == native_handle) return entry.second;
+  }
+  return 0;
+}
+
+// FIFA sends its P2P commudp to the live-server loopback (an internal XLSP-style
+// gateway) rather than to a peer's relay address, so those loopback datagrams
+// must also be routed through the relay. The relay's own control traffic and the
+// Blaze service port are not peer datagrams.
+static bool IsLocalhostP2P(uint32_t ina, uint16_t port) {
+  // 127.x.x.x in either byte order (the title's sockaddr and the server-address
+  // helpers disagree on endianness for the loopback value).
+  const bool loopback = ((ina >> 24) == 0x7Fu) || ((ina & 0xFFu) == 0x7Fu);
+  // The title actually sends its P2P commudp to the live-server address (an
+  // internal XLSP-style gateway). That is 127.0.0.1 in a one-box setup but the
+  // real host IP when live_server points elsewhere (e.g. a VM reaching the host
+  // over a virtual switch), so match LiveServerNBO in either byte order too.
+  const uint32_t sv = LiveServerNBO();
+  const uint32_t sv_sw = (sv >> 24) | ((sv >> 8) & 0xFF00u) | ((sv << 8) & 0xFF0000u) | (sv << 24);
+  const bool is_server = (ina == sv) || (ina == sv_sw);
+  if (!loopback && !is_server) return false;
+  const uint16_t relay_port = static_cast<uint16_t>(REXCVAR_GET(live_relay_port));
+  const uint16_t svc_port = static_cast<uint16_t>(REXCVAR_GET(live_service_port));
+  return port != relay_port && port != svc_port;
+}
+
+// Should a datagram be wrapped and sent through the relay? True for a relay
+// 10.77.x.y address, or for a localhost P2P datagram.
+static bool ShouldRelay(const N_XSOCKADDR_IN& to) {
+  return IsRelayAddr(to.sin_addr) ||
+         IsLocalhostP2P(to.sin_addr, static_cast<uint16_t>(to.sin_port));
+}
+
 // Wraps a datagram for a peer address and sends it to the server. Returns
 // the payload length the title expects, or -1.
 static int SendTo(XSocket* socket, const uint8_t* buf, uint32_t len, const N_XSOCKADDR_IN& to) {
   uint64_t dst = 0;
-  if (!IdFor(to.sin_addr, &dst)) return -1;
+  if (IsRelayAddr(to.sin_addr)) {
+    if (!IdFor(to.sin_addr, &dst)) return -1;
+  } else {
+    // Localhost P2P - leave dst 0 so the server routes by destination port (the
+    // peer id is not known to the runtime for this path). Remember the exact
+    // target sockaddr so incoming replies can be presented as coming from it.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_p2p_addr = to.sin_addr;
+    g_p2p_port = static_cast<uint16_t>(to.sin_port);
+  }
+  uint16_t sport = AnnouncedPort(socket->native_handle());
+  if (!sport) sport = socket->bound_port();
   std::vector<uint8_t> frame(kHeaderSize + len);
-  WriteHeader(frame.data(), OwnId(), dst, socket->bound_port(), static_cast<uint16_t>(to.sin_port));
+  WriteHeader(frame.data(), OwnId(), dst, sport, static_cast<uint16_t>(to.sin_port));
   std::memcpy(frame.data() + kHeaderSize, buf, len);
   const sockaddr_in server = ServerEndpoint();
   const int sent = ::sendto(static_cast<SOCKET>(socket->native_handle()),
@@ -510,14 +575,38 @@ static int SendTo(XSocket* socket, const uint8_t* buf, uint32_t len, const N_XSO
 // the buffer start and the source becomes the peer's private address.
 // Header-only frames (server keepalives) leave nothing to deliver.
 static void TranslateIncoming(uint8_t* buf, int* ret, N_XSOCKADDR_IN* from) {
-  if (*ret < 0 || !from || !FromServer(*from)) return;
+  if (*ret < 0 || !from) return;
+  if (!FromServer(*from)) return;
   uint64_t src, dst;
   uint16_t sport, dport;
   if (!ParseHeader(buf, static_cast<size_t>(*ret), &src, &dst, &sport, &dport)) return;
   const int payload = *ret - static_cast<int>(kHeaderSize);
   std::memmove(buf, buf + kHeaderSize, static_cast<size_t>(payload));
-  from->sin_addr = InAddrFor(src);
-  from->sin_port = sport;
+  // Present the datagram as coming from the exact sockaddr the title sent its P2P
+  // commudp to, so its commudp source check matches byte-for-byte. Falls back to
+  // the frame's source if the title has not sent a P2P datagram yet.
+  uint32_t p2p_addr;
+  uint16_t p2p_port;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    p2p_addr = g_p2p_addr;
+    p2p_port = g_p2p_port;
+  }
+  if (p2p_port != 0) {
+    from->sin_addr = p2p_addr;
+    from->sin_port = p2p_port;
+  } else if (dst == 0) {
+    // Route-by-port frame before this console has sent any P2P datagram itself
+    // (the peer's handshake arrived first). The title addresses peers at the
+    // live-server address, so present it that way from the very first frame:
+    // DirtySDK's listener adopts the source of the first INIT as the peer address
+    // and drops every later packet that does not match it.
+    from->sin_addr = ntohl(LiveServerNBO());
+    from->sin_port = sport;
+  } else {
+    from->sin_addr = InAddrFor(src);  // (locks g_mutex; must not hold it here)
+    from->sin_port = sport;
+  }
   *ret = payload;
 }
 
@@ -765,7 +854,22 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
+  // Peer datagrams addressed to another console (a relay 10.77.x.x address) must
+  // be wrapped and sent to the relay, exactly as NetDll_sendto does - the recv
+  // path already unwraps relay frames, so without this a datagram sent via
+  // WSASendTo to a relay address would never reach the peer.
+  if (REXCVAR_GET(live_enabled) && relay::ShouldRelay(native_to)) {
+    const int sent = relay::SendTo(socket.get(), combined_buffer_mem.data(),
+                                   combined_buffer_size, native_to);
+    if (num_bytes_sent && sent >= 0) {
+      *num_bytes_sent = static_cast<uint32_t>(sent);
+    }
+    return sent < 0 ? -1 : 0;
+  }
   socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
+  if (num_bytes_sent) {
+    *num_bytes_sent = combined_buffer_size;
+  }
 
   // TODO: Instantly complete overlapped
 
@@ -1316,6 +1420,7 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  const uint16_t announce_port = native_name.sin_port;  // host order (be<> read), the port the title asked for
   if (REXCVAR_GET(net_loopback_only) && !REXCVAR_GET(live_enabled) && native_name.sin_addr == 0) {
     // INADDR_ANY -> loopback: keeps the socket usable for the title without
     // exposing a listener on the host network. Online play needs real binds.
@@ -1325,6 +1430,19 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     REXKRNL_INFO("[live] bind sock={} port={}", socket_handle, static_cast<uint16_t>(native_name.sin_port));
   }
   X_STATUS status = socket->Bind(&native_name, namelen);
+  if (XFAILED(status) && REXCVAR_GET(live_enabled) && announce_port != 0) {
+    // The title's port is likely already held by another local instance. Bind
+    // an ephemeral host port instead; the relay still addresses this socket by
+    // (relay id, announced port) below, so a second co-running instance stays
+    // reachable without colliding on the host port.
+    N_XSOCKADDR_IN ephemeral(native_name);
+    ephemeral.sin_port = 0;
+    status = socket->Bind(&ephemeral, namelen);
+    if (!XFAILED(status)) {
+      REXKRNL_INFO("[live] bind port {} in use; ephemeral host port for sock={}",
+                   ntohs(announce_port), socket_handle);
+    }
+  }
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
@@ -1335,8 +1453,9 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     if (getsockopt(static_cast<SOCKET>(socket->native_handle()), SOL_SOCKET, SO_TYPE,
                    reinterpret_cast<char*>(&type), &type_len) == 0 &&
         type == SOCK_DGRAM) {
-      // Announce this port to the peer relay so other consoles can reach it.
-      relay::RegisterBound(socket->native_handle(), socket->bound_port());
+      // Announce the title's port (not the possibly-ephemeral host port) to the
+      // peer relay so other consoles can reach it.
+      relay::RegisterBound(socket->native_handle(), announce_port);
     }
   }
 
@@ -1438,6 +1557,21 @@ u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_
   if (ret != 0) {
     XThread::SetLastError(0x2749);
     return -1;
+  }
+  // Report the title-requested (announced) port rather than the ephemeral host
+  // port a second local instance fell back to. The title uses this as its P2P
+  // game port and advertises it to peers; the relay routes on the announced
+  // port, so both consoles must agree on it.
+  if (REXCVAR_GET(live_enabled)) {
+    const uint16_t announced = relay::AnnouncedPort(socket->native_handle());
+    if (announced != 0) {
+      // AnnouncedPort is the title's port in host order; sin_port is network
+      // order like the getsockname result it replaces. Storing it unswapped made
+      // the title believe its game port was byte-swapped (1000 -> 59395) and
+      // address peers at that port, so two consoles could disagree on the port
+      // and the commudp handshake never latched.
+      local.sin_port = htons(announced);
+    }
   }
   if (name) {
     StoreGuestSockaddr(name, local);
@@ -1713,7 +1847,7 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  if (REXCVAR_GET(live_enabled) && relay::IsRelayAddr(native_to.sin_addr)) {
+  if (REXCVAR_GET(live_enabled) && relay::ShouldRelay(native_to)) {
     const int sent = relay::SendTo(socket.get(), buf_ptr, buf_len, native_to);
     if (sent < 0) {
       XThread::SetLastError(0x2751);  // WSAEHOSTUNREACH
