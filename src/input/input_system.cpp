@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -40,6 +41,11 @@ namespace {
 // a real pad off guest user 0. SlotAssignment routes them by their synthetic
 // flag and never reads this value.
 constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
+
+// Every XamInput* entry rebuilds the device list; titles poll input from more
+// than one guest thread at once, and two RefreshDevices bodies racing on the
+// same vectors corrupt the heap. One lock serialises the whole query.
+std::recursive_mutex g_input_lock;
 
 }  // namespace
 
@@ -83,6 +89,7 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
 }
 
 void InputSystem::RefreshDevices() {
+  std::lock_guard<std::recursive_mutex> lock(g_input_lock);
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
   std::vector<DeviceInfo> enumerated;
@@ -191,6 +198,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::recursive_mutex> lock(g_input_lock);
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -218,6 +226,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::recursive_mutex> lock(g_input_lock);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -257,6 +266,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::recursive_mutex> lock(g_input_lock);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -299,6 +309,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::recursive_mutex> lock(g_input_lock);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
