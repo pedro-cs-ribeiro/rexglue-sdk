@@ -196,6 +196,13 @@ std::vector<InviteInfo> FsrFetchInvites(uint64_t self_xuid) {
     if (line.empty()) {
       continue;
     }
+    // "!<text>": a notice for this player.
+    if (line[0] == '!') {
+      InviteInfo n;
+      n.notice = line.substr(1);
+      out.push_back(std::move(n));
+      continue;
+    }
     // "<from_id>\t<from_name>\t<game_id>"
     size_t t1 = line.find('\t');
     if (t1 == std::string::npos) {

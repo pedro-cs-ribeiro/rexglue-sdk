@@ -683,7 +683,7 @@ class InviteReceiveDialog : public XamDialog {
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Game Invite", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
       ImGui::SetWindowFontScale(1.6f);
-      ImGui::Text("%s invited you to their game.", from_name_.c_str());
+      ImGui::Text("%s invited you to play.", from_name_.c_str());
       ImGui::Spacing();
       ImGui::Separator();
       if (ImGui::Button("Accept")) {
@@ -709,6 +709,41 @@ class InviteReceiveDialog : public XamDialog {
   std::string from_name_;
 };
 
+// A message from the online server (e.g. an accepted invite), with an OK button.
+class NoticeDialog : public XamDialog {
+ public:
+  NoticeDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string text)
+      : XamDialog(imgui_drawer), text_(std::move(text)) {}
+
+  void OnDraw(ImGuiIO& io) override {
+    if (!has_opened_) {
+      ImGui::OpenPopup("Online");
+      has_opened_ = true;
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.5f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Online", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::SetWindowFontScale(1.6f);
+      ImGui::TextWrapped("%s", text_.c_str());
+      ImGui::Spacing();
+      ImGui::Separator();
+      if (ImGui::Button("OK") || ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+          ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+      ImGui::EndPopup();
+    } else {
+      Close();
+    }
+  }
+
+ private:
+  bool has_opened_ = false;
+  std::string text_;
+};
+
 namespace {
 
 void InvitePollLoop() {
@@ -724,6 +759,16 @@ void InvitePollLoop() {
     }
     const uint64_t self_xuid = profile->online_xuid();
     for (const auto& inv : FsrFetchInvites(self_xuid)) {
+      if (!inv.notice.empty()) {
+        const Runtime* emulator = REX_KERNEL_STATE()->emulator();
+        ui::ImGuiDrawer* imgui_drawer = emulator ? emulator->imgui_drawer() : nullptr;
+        REXKRNL_INFO("online notice: {}", inv.notice);
+        if (imgui_drawer && !REXCVAR_GET(headless)) {
+          xeXamDispatchDialog<NoticeDialog>(new NoticeDialog(imgui_drawer, inv.notice),
+                                            [](NoticeDialog*) -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
+        }
+        continue;
+      }
       if (!handled.insert(inv.from_id).second) {
         continue;  // already prompted for this inviter
       }
@@ -741,7 +786,7 @@ void InvitePollLoop() {
       xeXamDispatchDialog<InviteReceiveDialog>(
           new InviteReceiveDialog(imgui_drawer, inv.from_name), close, 0);
       if (accepted) {
-        REXKRNL_INFO("accepted invite from {}; joining game", inv.from_name);
+        REXKRNL_INFO("accepted invite from {}", inv.from_name);
         FsrAccept(self_xuid, inv.from_id);
       }
     }
