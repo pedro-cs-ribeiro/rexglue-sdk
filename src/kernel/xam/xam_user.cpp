@@ -21,6 +21,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
@@ -129,6 +130,13 @@ static void SyncLiveIdentity() {
     // Once we are online, watch for game invites in the background.
     StartInvitePollThread();
   }
+}
+
+// The online country of any signed-in user is the console's country: the
+// country ids below 111 are the same in both tables.
+u32 XamUserGetOnlineCountryFromXUID_entry(u64 xuid) {
+  uint32_t country = REXCVAR_GET(user_country);
+  return country > 0 && country <= 110 ? country : 103;  // 103 = US
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
@@ -802,6 +810,8 @@ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
 
 REX_EXPORT(__imp__XamUserGetXUID, rex::kernel::xam::XamUserGetXUID_entry)
 REX_EXPORT(__imp__XamUserGetSigninState, rex::kernel::xam::XamUserGetSigninState_entry)
+REX_EXPORT(__imp__XamUserGetOnlineCountryFromXUID,
+           rex::kernel::xam::XamUserGetOnlineCountryFromXUID_entry)
 REX_EXPORT(__imp__XamUserGetSigninInfo, rex::kernel::xam::XamUserGetSigninInfo_entry)
 REX_EXPORT(__imp__XamUserGetName, rex::kernel::xam::XamUserGetName_entry)
 REX_EXPORT(__imp__XamUserGetGamerTag, rex::kernel::xam::XamUserGetGamerTag_entry)
@@ -841,7 +851,6 @@ REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
 REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);

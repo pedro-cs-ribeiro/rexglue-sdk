@@ -21,7 +21,20 @@ namespace rex {
 namespace kernel {
 namespace xam {
 
+const char16_t* xeXamGetCountryString(uint8_t id);  // xam_locale.cpp
+
 namespace {
+
+// ISO code of the console's country (user_country), e.g. "PT"; empty when the
+// id has no code.
+std::string ConsoleCountryCode() {
+  const uint32_t id = rex::cvar::Query<uint32_t>("user_country");
+  const char16_t* code = id <= 0xFF ? xeXamGetCountryString(static_cast<uint8_t>(id)) : nullptr;
+  if (!code || !code[0] || !code[1] || (code[0] == u'Z' && code[1] == u'Z')) {
+    return {};
+  }
+  return {static_cast<char>(code[0]), static_cast<char>(code[1])};
+}
 
 // The easw HTTP surface (which also serves the /fsr/ control routes) listens
 // on port 80.
@@ -132,9 +145,11 @@ void FsrSendInvite(uint64_t from_xuid, uint32_t to_id) {
 }
 
 std::vector<InviteInfo> FsrFetchInvites(uint64_t self_xuid) {
-  char path[64];
-  std::snprintf(path, sizeof(path), "/fsr/invites?self=%016llx",
-                static_cast<unsigned long long>(self_xuid));
+  // The poll also tells the server the console's country (the title reports
+  // an unknown country in its Blaze locale).
+  char path[96];
+  std::snprintf(path, sizeof(path), "/fsr/invites?self=%016llx&country=%s",
+                static_cast<unsigned long long>(self_xuid), ConsoleCountryCode().c_str());
   std::string body = HttpRequest("GET", path, {});
   std::vector<InviteInfo> out;
   std::istringstream lines(body);
