@@ -80,13 +80,32 @@ add_custom_command(
 
 add_custom_target(embed_templates DEPENDS ${EMBEDDED_HEADERS})
 
+# Hash of the codegen sources, used in the generated modules' fingerprint.
+set(CODEGEN_HASH_DIRS "${CMAKE_CURRENT_SOURCE_DIR};${REXGLUE_ROOT}/include/rex/codegen")
+file(GLOB_RECURSE CODEGEN_HASHED_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.inc"
+    "${REXGLUE_ROOT}/include/rex/codegen/*.h" "${REXGLUE_ROOT}/include/rex/codegen/*.inc")
+set(CODEGEN_HASH_HEADER "${TEMPLATE_OUTPUT_DIR}/codegen_source_hash.h")
+add_custom_command(
+    OUTPUT ${CODEGEN_HASH_HEADER}
+    COMMAND ${CMAKE_COMMAND}
+        "-DSOURCE_DIRS=${CODEGEN_HASH_DIRS}"
+        -DOUTPUT=${CODEGEN_HASH_HEADER}
+        -P ${REXGLUE_ROOT}/cmake/hash_codegen_sources.cmake
+    DEPENDS ${CODEGEN_HASHED_FILES} ${REXGLUE_ROOT}/cmake/hash_codegen_sources.cmake
+    COMMENT "Hashing codegen sources"
+    VERBATIM
+)
+add_custom_target(hash_codegen_sources DEPENDS ${CODEGEN_HASH_HEADER})
+
 add_library(rexcodegen STATIC
     ${CODEGEN_CORE_SOURCES}
     ${CODEGEN_PPC_SOURCES}
     ${CODEGEN_BUILDER_SOURCES}
 )
 add_library(rex::codegen ALIAS rexcodegen)
-add_dependencies(rexcodegen embed_templates)
+add_dependencies(rexcodegen embed_templates hash_codegen_sources)
 
 rex_target_pch(rexcodegen <rex/codegen/function_types.h>)
 

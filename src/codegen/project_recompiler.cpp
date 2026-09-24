@@ -24,8 +24,6 @@
 #include <rex/codegen/binary_view.h>
 #include <rex/codegen/codegen.h>
 #include <rex/codegen/codegen_context.h>
-#include <rex/filesystem.h>
-#include <rex/hash.h>
 #include <rex/codegen/codegen_writer.h>
 #include <rex/codegen/config.h>
 #include <rex/codegen/output_stamp.h>
@@ -41,6 +39,7 @@
 
 #include "codegen_flags.h"
 #include "codegen_logging.h"
+#include "codegen_source_hash.h"
 #include "file_io.h"
 #include "template_registry_internal.h"
 
@@ -78,15 +77,12 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
   return inputs;
 }
 
-// Content hash of the running codegen executable ("<unknown>" when the path
-// cannot be determined, so a stale stamp is at worst kept as before).
+// Hash of the codegen sources this tool was built from (see
+// cmake/hash_codegen_sources.cmake). The tool also links the runtime, so a
+// hash of the executable itself changed on every runtime change and forced
+// every module to regenerate.
 static std::string ToolFingerprint() {
-  static const std::string digest = [] {
-    auto path = rex::filesystem::GetExecutablePath();
-    std::string hash = path.empty() ? std::string() : rex::hash_file(path);
-    return hash.empty() ? std::string("<unknown>") : hash;
-  }();
-  return digest;
+  return REXCODEGEN_SOURCE_HASH;
 }
 
 std::string FingerprintModule(const RecompilerConfig& cfg,
@@ -94,8 +90,8 @@ std::string FingerprintModule(const RecompilerConfig& cfg,
                               std::string_view sdkVersion) {
   std::vector<std::string> flags{
       fmt::format("templates={}", EmbeddedTemplatesHash()),
-      // The builders live in this executable: a codegen change must regenerate
-      // even when every input file is unchanged.
+      // A codegen change must regenerate even when every input file is
+      // unchanged.
       fmt::format("tool={}", ToolFingerprint()),
       fmt::format("generate_exception_handlers={}", cfg.generateExceptionHandlers),
       fmt::format("max_jump_extension={}", cfg.maxJumpExtension),
