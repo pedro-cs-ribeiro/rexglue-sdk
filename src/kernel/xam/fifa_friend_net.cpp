@@ -7,8 +7,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 
 #include <rex/cvar.h>
@@ -104,11 +106,9 @@ std::string HttpRequest(const std::string& method, const std::string& path,
 
 }  // namespace
 
-std::vector<FriendEntry> FsrFetchPlayers(uint64_t self_xuid) {
-  char path[64];
-  std::snprintf(path, sizeof(path), "/fsr/players?self=%016llx",
-                static_cast<unsigned long long>(self_xuid));
-  std::string body = HttpRequest("GET", path, {});
+namespace {
+// Parses "<id>\t<name>\t<xuid_hex>[\t<online 0|1>]" lines.
+std::vector<FriendEntry> ParsePlayerLines(const std::string& body) {
   std::vector<FriendEntry> out;
   std::istringstream lines(body);
   std::string line;
@@ -131,10 +131,45 @@ std::vector<FriendEntry> FsrFetchPlayers(uint64_t self_xuid) {
     FriendEntry e;
     e.id = static_cast<uint32_t>(std::strtoul(line.substr(0, t1).c_str(), nullptr, 10));
     e.name = line.substr(t1 + 1, t2 - t1 - 1);
-    e.xuid = std::strtoull(line.substr(t2 + 1).c_str(), nullptr, 16);
+    size_t t3 = line.find('\t', t2 + 1);
+    e.xuid = std::strtoull(line.substr(t2 + 1, t3 == std::string::npos ? std::string::npos
+                                                                        : t3 - t2 - 1)
+                               .c_str(),
+                           nullptr, 16);
+    e.online = t3 != std::string::npos && line.compare(t3 + 1, 1, "1") == 0;
     out.push_back(std::move(e));
   }
   return out;
+}
+}  // namespace
+
+std::vector<FriendEntry> FsrFetchPlayers(uint64_t self_xuid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/fsr/players?self=%016llx",
+                static_cast<unsigned long long>(self_xuid));
+  return ParsePlayerLines(HttpRequest("GET", path, {}));
+}
+
+std::vector<FriendEntry> FsrFetchFriends(uint64_t self_xuid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/fsr/friends?self=%016llx",
+                static_cast<unsigned long long>(self_xuid));
+  return ParsePlayerLines(HttpRequest("GET", path, {}));
+}
+
+std::vector<FriendEntry> FsrCachedFriends(uint64_t self_xuid) {
+  static std::mutex mutex;
+  static std::vector<FriendEntry> cached;
+  static uint64_t cached_for = 0;
+  static std::chrono::steady_clock::time_point fetched;
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (cached_for != self_xuid || now - fetched > std::chrono::seconds(10)) {
+    cached = FsrFetchFriends(self_xuid);
+    cached_for = self_xuid;
+    fetched = now;
+  }
+  return cached;
 }
 
 void FsrSendInvite(uint64_t from_xuid, uint32_t to_id) {

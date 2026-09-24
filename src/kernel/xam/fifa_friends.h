@@ -19,6 +19,7 @@ struct FriendEntry {
   uint32_t id = 0;       // server-side player id (invite target)
   std::string name;      // gamertag shown in the picker
   uint64_t xuid = 0;     // online xuid
+  bool online = false;   // signed in to the server right now
 };
 
 // An invite this player has received.
@@ -31,11 +32,20 @@ struct InviteInfo {
 // GET /fsr/players: everyone online except `self_xuid`. Empty on any failure.
 std::vector<FriendEntry> FsrFetchPlayers(uint64_t self_xuid);
 
+// GET /fsr/friends: the players `self_xuid` has played against, each with
+// their online state. Empty on any failure.
+std::vector<FriendEntry> FsrFetchFriends(uint64_t self_xuid);
+
+// FsrFetchFriends, cached for a few seconds (the title asks several times in a
+// row and from several places).
+std::vector<FriendEntry> FsrCachedFriends(uint64_t self_xuid);
+
 // POST /fsr/invite: ask the server to deliver a game invite from `from_xuid`
 // to the player with id `to_id`.
 void FsrSendInvite(uint64_t from_xuid, uint32_t to_id);
 
-// GET /fsr/invites: game invites waiting for `self_xuid`.
+// GET /fsr/invites: game invites waiting for `self_xuid` (the request also
+// carries the console's country).
 std::vector<InviteInfo> FsrFetchInvites(uint64_t self_xuid);
 
 // POST /fsr/accept: accept the invite from `from_id` and join that game.

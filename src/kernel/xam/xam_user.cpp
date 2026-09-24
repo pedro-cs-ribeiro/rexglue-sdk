@@ -515,8 +515,11 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   return 6 /* 6 appears to be Gold */;
 }
 
-u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
-                                 u32 overlapped_ptr) {
+// XamUserAreUsersFriends(user_index, xuids, xuid_count, result, overlapped):
+// true when every XUID is on the user's friend list (the players they have met
+// online, from the server).
+u32 XamUserAreUsersFriends_entry(u32 user_index, mapped_u64 xuids, u32 xuid_count,
+                                 mapped_u32 out_value, u32 overlapped_ptr) {
   uint32_t are_friends = 0;
   X_RESULT result;
 
@@ -528,8 +531,19 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
       if (user_profile->signin_state() == 0) {
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
-        // No friends!
         are_friends = 0;
+        if (xuids && xuid_count && LiveEnabled()) {
+          const auto friends = FsrCachedFriends(user_profile->online_xuid());
+          are_friends = 1;
+          for (uint32_t i = 0; i < xuid_count; ++i) {
+            const uint64_t xuid = xuids[i];
+            bool found = false;
+            for (const auto& f : friends) {
+              found = found || f.xuid == xuid;
+            }
+            are_friends = are_friends && found;
+          }
+        }
         result = X_ERROR_SUCCESS;
       }
     } else {

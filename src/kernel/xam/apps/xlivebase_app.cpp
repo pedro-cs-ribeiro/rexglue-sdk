@@ -12,11 +12,18 @@
 #include <rex/cvar.h>
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/user_profile.h>
+#include <rex/system/xenumerator.h>
 #include <rex/thread.h>
 
+#include "../fifa_friends.h"
+
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -29,6 +36,24 @@ namespace apps {
 using namespace rex::system;
 
 XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state) : App(kernel_state, 0xFC) {}
+
+namespace {
+
+// XONLINE_FRIEND: { XUID xuid; CHAR szGamertag[16]; DWORD dwFriendState;
+// XNKID sessionID; DWORD dwTitleID; FILETIME ftUserTime; XNKID xnkidInvite;
+// FILETIME gameinviteTime; DWORD cchRichPresence; WCHAR wszRichPresence[64]; }
+constexpr uint32_t kFriendSize = 0xC4;
+constexpr uint32_t kFriendStateOnline = 0x1;
+constexpr uint32_t kFriendStatePlaying = 0x2;
+
+// XFriendsCreateEnumerator arguments arrive as an XMsg argument block: 16-byte
+// entries { DWORD type; DWORD pad; QWORD pointer-to-argument }.
+uint32_t BlockArgPointer(memory::Memory* mem, uint32_t block, uint32_t index) {
+  auto* entry = mem->TranslateVirtual<const uint8_t*>(block + index * 16);
+  return static_cast<uint32_t>(memory::load_and_swap<uint64_t>(entry + 8));
+}
+
+}  // namespace
 
 // http://mb.mirage.org/bugzilla/xliveless/main.c
 
@@ -91,13 +116,49 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
     case 0x00058020: {
-      // 0x00058004 is called right before this.
-      // We should create a XamEnumerate-able empty list here, but I'm not
-      // sure of the format.
-      // buffer_length seems to be the same ptr sent to 0x00058004.
-      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) unimplemented", buffer_ptr,
-                    buffer_length);
-      return X_E_FAIL;
+      // XFriendsCreateEnumerator(dwUserIndex, dwStartingIndex, dwFriendsToReturn,
+      // pcbBuffer, phEnum); arg2 is the argument block. The friends are the
+      // players the user has met online, served by the online server.
+      const uint32_t block = buffer_length;
+      if (!block) {
+        return X_E_INVALIDARG;
+      }
+      auto arg = [&](uint32_t i) { return BlockArgPointer(memory_, block, i); };
+      const uint32_t user_index = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(arg(0)));
+      const uint32_t start = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(arg(1)));
+      const uint32_t count = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(arg(2)));
+      const uint32_t size_out = arg(3);
+      const uint32_t handle_out = arg(4);
+      std::vector<FriendEntry> friends;
+      if (rex::cvar::Query<bool>("live_enabled") && user_index == 0) {
+        auto* profile = kernel_state_->user_profile();
+        friends = FsrCachedFriends(profile ? profile->online_xuid() : 0);
+      }
+      const uint32_t items = std::max<uint32_t>(1, std::min<uint32_t>(count, 100));
+      auto* e = new XStaticUntypedEnumerator(kernel_state_, items, kFriendSize);
+      if (XFAILED(e->Initialize(user_index, app_id(), 0x58020, 0x58021, 0))) {
+        e->Release();
+        return X_E_FAIL;
+      }
+      for (size_t i = start; i < friends.size() && i - start < count; ++i) {
+        const FriendEntry& f = friends[i];
+        uint8_t* item = e->AppendItem();
+        std::memset(item, 0, kFriendSize);
+        memory::store_and_swap<uint64_t>(item + 0x00, f.xuid);
+        std::memcpy(item + 0x08, f.name.data(), std::min<size_t>(f.name.size(), 15));
+        memory::store_and_swap<uint32_t>(
+            item + 0x18, f.online ? kFriendStateOnline | kFriendStatePlaying : 0);
+        memory::store_and_swap<uint32_t>(item + 0x24, f.online ? kernel_state_->title_id() : 0);
+      }
+      if (size_out) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(size_out), items * kFriendSize);
+      }
+      if (handle_out) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(handle_out), e->handle());
+      }
+      REXKRNL_INFO("XFriendsCreateEnumerator: {} friend(s) -> handle {:#x}", friends.size(),
+                   e->handle());
+      return X_E_SUCCESS;
     }
     case 0x00058023: {
       REXKRNL_DEBUG(
