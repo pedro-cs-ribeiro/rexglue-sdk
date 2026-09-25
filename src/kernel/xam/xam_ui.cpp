@@ -222,6 +222,14 @@ u32 XamIsUIActive_entry() {
 }
 
 bool XamGetPadStateForUI(uint32_t user_index, rex::input::X_INPUT_GAMEPAD* out);
+}  // namespace xam
+}  // namespace kernel
+namespace input::script {
+// Anchors a scripted controller (--input_script) on UI events.
+void NotifyGuestScreen(const char* name);
+}  // namespace input::script
+namespace kernel {
+namespace xam {
 
 // Controller input for the dialogs below: D-pad or left stick moves, A
 // confirms, B backs out (arrows, Enter/Space and Esc on a keyboard). Edge-triggered; whatever is already held when the
@@ -735,6 +743,7 @@ u32 XamShowFriendsUI_entry(u32 user_index) {
     }
     return X_ERROR_SUCCESS;
   };
+  rex::input::script::NotifyGuestScreen("XAM-SHOW-FriendPicker");
   // Synchronous (overlapped = 0): blocks this thread while the picker is up,
   // which also stops the game from re-opening it every frame.
   xeXamDispatchDialog<FriendPickerDialog>(new FriendPickerDialog(imgui_drawer, friends), close, 0);
@@ -895,6 +904,7 @@ void InvitePollLoop() {
         continue;
       }
       REXKRNL_INFO("received game invite from {}", inv.from_name);
+      rex::input::script::NotifyGuestScreen("XAM-SHOW-InviteDialog");
       bool accepted = false;
       auto close = [&accepted](InviteReceiveDialog* dialog) -> X_RESULT {
         accepted = dialog->accepted();
