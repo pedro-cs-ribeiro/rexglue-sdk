@@ -38,6 +38,20 @@ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uin
   return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
 }
 
+namespace {
+thread_local uint32_t t_message_result_length = 0;
+}  // namespace
+
+void SetMessageResultLength(uint32_t length) {
+  t_message_result_length = length;
+}
+
+uint32_t TakeMessageResultLength() {
+  const uint32_t length = t_message_result_length;
+  t_message_result_length = 0;
+  return length;
+}
+
 X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
                                            uint32_t buffer_length) {
   App* app;

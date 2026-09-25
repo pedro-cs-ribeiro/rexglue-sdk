@@ -55,15 +55,17 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+  TakeMessageResultLength();
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
                                                                         buffer_length);
+  const uint32_t result_length = TakeMessageResultLength();
   if (result == X_E_NOTFOUND) {
     REXKRNL_ERROR("XMsgStartIORequestEx: app {:08X} undefined", app);
     result = X_E_INVALIDARG;
     XThread::SetLastError(X_ERROR_NOT_FOUND);
   }
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr, result, 0, result_length);
     result = X_ERROR_IO_PENDING;
   }
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {

@@ -47,6 +47,12 @@ class App {
   uint32_t app_id_;
 };
 
+// The byte count an asynchronous message reports on its overlapped when it
+// completes (XGetOverlappedResult's length). An app sets it while handling
+// the message; XMsgStartIORequest takes it for the completion.
+void SetMessageResultLength(uint32_t length);
+uint32_t TakeMessageResultLength();
+
 class AppManager {
  public:
   void RegisterApp(std::unique_ptr<App> app);

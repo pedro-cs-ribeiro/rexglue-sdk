@@ -63,12 +63,43 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
     case 0x0005000C: {
-      // XStringVerify / content filter (FilterText): the title checks player
-      // strings against the offensive-word service before an online match.
-      // We run no filter, so approve everything: the result buffer is an array
-      // of per-string HRESULTs (all S_OK = allowed). arg block layout is small
-      // and title-specific, so just succeed - the title proceeds with the text.
-      REXKRNL_DEBUG("XLiveBaseStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
+      // XStringVerify (the title's Xbox Live library, called by Blaze's
+      // profanity filter for player and team names seen online). The buffer
+      // holds the library's task: +0x10/+0x14 reply area, +0x18/+0x1C the
+      // request (little-endian: u32, u32 flags, u16 locale length, u16
+      // string count, locale, then u16-length strings), and at +0x2C/+0x30
+      // the caller's result buffer and its size 6 + 4 * count, which gets a
+      // packed STRING_VERIFY_RESPONSE { WORD wNumStrings; HRESULT*
+      // pStringResult; } with the HRESULTs right after it. There is no
+      // filter service here, so every string is allowed (S_OK). Without
+      // results the title's filter job fails and it treats every name it
+      // checked as offensive.
+      if (!buffer || buffer_length < 4) {
+        return X_E_INVALIDARG;
+      }
+      const uint32_t task = memory::load_and_swap<uint32_t>(buffer + 0);
+      auto* t = memory_->TranslateVirtual<const uint8_t*>(task);
+      const uint32_t request = memory::load_and_swap<uint32_t>(t + 0x18);
+      auto* req = memory_->TranslateVirtual<const uint8_t*>(request);
+      const uint16_t count = static_cast<uint16_t>(req[10] | (req[11] << 8));
+      const uint32_t results_size = 6 + 4 * uint32_t(count);
+      uint32_t results = 0;
+      for (uint32_t o = 0x20; o + 8 <= 0x50; o += 4) {
+        if (memory::load_and_swap<uint32_t>(t + o + 4) == results_size) {
+          results = memory::load_and_swap<uint32_t>(t + o);
+          break;
+        }
+      }
+      if (!results) {
+        return X_E_SUCCESS;
+      }
+      auto* out = memory_->TranslateVirtual<uint8_t*>(results);
+      std::memset(out, 0, results_size);
+      memory::store_and_swap<uint16_t>(out + 0, count);
+      memory::store_and_swap<uint32_t>(out + 2, results + 6);
+      // The caller only reads the results when the request reports the
+      // response's size as its completion length.
+      system::xam::SetMessageResultLength(results_size);
       return X_E_SUCCESS;
     }
     case 0x00058004: {
