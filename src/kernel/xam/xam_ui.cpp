@@ -25,6 +25,7 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+#include <rex/input/input.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -81,6 +82,8 @@ class XamDialog : public rex::ui::ImGuiDialog {
   std::function<void()> close_callback_ = nullptr;
 };
 
+void XamHoldButtonsAfterUI();
+
 template <typename T>
 X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callback,
                              uint32_t overlapped) {
@@ -98,6 +101,7 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
       fence.Wait();
+      XamHoldButtonsAfterUI();
       --xam_dialogs_shown_;
     } else {
       delete dialog;
@@ -140,6 +144,7 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
       fence.Wait();
+      XamHoldButtonsAfterUI();
       --xam_dialogs_shown_;
     } else {
       delete dialog;
@@ -216,6 +221,64 @@ u32 XamIsUIActive_entry() {
   return xeXamIsUIActive();
 }
 
+bool XamGetPadStateForUI(uint32_t user_index, rex::input::X_INPUT_GAMEPAD* out);
+
+// Controller input for the dialogs below: D-pad or left stick moves, A
+// confirms, B backs out (arrows, Enter/Space and Esc on a keyboard). Edge-triggered; whatever is already held when the
+// dialog opens is ignored until it is released.
+class PadNav {
+ public:
+  bool up = false, down = false, left = false, right = false;
+  bool confirm = false, back = false;
+
+  void Poll() {
+    rex::input::X_INPUT_GAMEPAD pad = {};
+    uint32_t now = 0;
+    if (XamGetPadStateForUI(0, &pad)) {
+      const uint16_t buttons = pad.buttons;
+      const int16_t lx = pad.thumb_lx;
+      const int16_t ly = pad.thumb_ly;
+      now = buttons & (kUp | kDown | kLeft | kRight | kA | kB);
+      if (ly > kStick) now |= kUp;
+      if (ly < -kStick) now |= kDown;
+      if (lx < -kStick) now |= kLeft;
+      if (lx > kStick) now |= kRight;
+    }
+    const uint32_t pressed = primed_ ? (now & ~held_) : 0;
+    held_ = now;
+    primed_ = true;
+    // The keyboard reaches the dialog through ImGui, not the pad.
+    auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, false); };
+    up = (pressed & kUp) || key(ImGuiKey_UpArrow);
+    down = (pressed & kDown) || key(ImGuiKey_DownArrow);
+    left = (pressed & kLeft) || key(ImGuiKey_LeftArrow);
+    right = (pressed & kRight) || key(ImGuiKey_RightArrow);
+    confirm = (pressed & kA) || key(ImGuiKey_Enter) || key(ImGuiKey_KeypadEnter) ||
+              key(ImGuiKey_Space);
+    back = (pressed & kB) || key(ImGuiKey_Escape);
+  }
+
+ private:
+  static constexpr uint32_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008;
+  static constexpr uint32_t kA = 0x1000, kB = 0x2000;
+  static constexpr int16_t kStick = 16000;
+  uint32_t held_ = 0;
+  bool primed_ = false;
+};
+
+// A button drawn highlighted when it has the controller's focus.
+bool FocusButton(const char* label, bool focused) {
+  if (focused) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.72f, 0.07f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+  }
+  const bool clicked = ImGui::Button(label);
+  if (focused) {
+    ImGui::PopStyleColor(2);
+  }
+  return clicked;
+}
+
 class MessageBoxDialog : public XamDialog {
  public:
   MessageBoxDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string title, std::string description,
@@ -246,12 +309,21 @@ class MessageBoxDialog : public XamDialog {
       }
       if (first_draw) {
         ImGui::SetKeyboardFocusHere();
+        focus_ = default_button_ < buttons_.size() ? default_button_ : 0;
       }
-      for (size_t i = 0; i < buttons_.size(); ++i) {
-        if (ImGui::Button(buttons_[i].c_str())) {
+      pad_.Poll();
+      const size_t count = buttons_.size();
+      if (count) {
+        if (pad_.left || pad_.up) focus_ = (focus_ + count - 1) % count;
+        if (pad_.right || pad_.down) focus_ = (focus_ + 1) % count;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        const bool pad_pick = (pad_.confirm && focus_ == i) || (pad_.back && i == count - 1);
+        if (FocusButton(buttons_[i].c_str(), focus_ == i) || pad_pick) {
           chosen_button_ = static_cast<uint32_t>(i);
           ImGui::CloseCurrentPopup();
           Close();
+          break;
         }
         ImGui::SameLine();
       }
@@ -265,6 +337,8 @@ class MessageBoxDialog : public XamDialog {
 
  private:
   bool has_opened_ = false;
+  PadNav pad_;
+  size_t focus_ = 0;
   std::string title_;
   std::string description_;
   std::vector<std::string> buttons_;
@@ -600,6 +674,10 @@ class FriendPickerDialog : public XamDialog {
         if (selected_ < 0 || selected_ >= static_cast<int>(friends_.size())) {
           selected_ = 0;
         }
+        pad_.Poll();
+        const int count = static_cast<int>(friends_.size());
+        if (pad_.up) selected_ = (selected_ + count - 1) % count;
+        if (pad_.down) selected_ = (selected_ + 1) % count;
         ImGui::Text("Select a friend to invite to your game:");
         ImGui::Separator();
         for (size_t i = 0; i < friends_.size(); ++i) {
@@ -608,18 +686,18 @@ class FriendPickerDialog : public XamDialog {
           }
         }
         ImGui::Separator();
-        // Enter/keypad-Enter confirms the highlighted friend (in addition to the
-        // Invite button), so the blade is completable by keyboard/controller.
-        const bool confirm_key =
-            ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-        if (ImGui::Button("Invite") || confirm_key) {
+        // A / Enter invites the highlighted friend, like the Invite button.
+        if (FocusButton("Invite", true) || pad_.confirm) {
           chosen_ = selected_;
           ImGui::CloseCurrentPopup();
           Close();
         }
         ImGui::SameLine();
       }
-      if (ImGui::Button("Cancel")) {
+      if (friends_.empty()) {
+        pad_.Poll();
+      }
+      if (ImGui::Button("Cancel") || pad_.back || (friends_.empty() && pad_.confirm)) {
         chosen_ = -1;
         ImGui::CloseCurrentPopup();
         Close();
@@ -632,6 +710,7 @@ class FriendPickerDialog : public XamDialog {
 
  private:
   bool has_opened_ = false;
+  PadNav pad_;
   int selected_ = -1;
   int chosen_ = -1;
   std::vector<FriendEntry> friends_;
@@ -686,13 +765,18 @@ class InviteReceiveDialog : public XamDialog {
       ImGui::Text("%s invited you to play.", from_name_.c_str());
       ImGui::Spacing();
       ImGui::Separator();
-      if (ImGui::Button("Accept")) {
+      pad_.Poll();
+      if (pad_.left || pad_.right || pad_.up || pad_.down) {
+        accept_focused_ = !accept_focused_;
+      }
+      if (FocusButton("Accept", accept_focused_) || (pad_.confirm && accept_focused_)) {
         accepted_ = true;
         ImGui::CloseCurrentPopup();
         Close();
       }
       ImGui::SameLine();
-      if (ImGui::Button("Decline")) {
+      if (FocusButton("Decline", !accept_focused_) || (pad_.confirm && !accept_focused_) ||
+          pad_.back) {
         accepted_ = false;
         ImGui::CloseCurrentPopup();
         Close();
@@ -705,6 +789,8 @@ class InviteReceiveDialog : public XamDialog {
 
  private:
   bool has_opened_ = false;
+  PadNav pad_;
+  bool accept_focused_ = true;
   bool accepted_ = false;
   std::string from_name_;
 };
@@ -728,8 +814,8 @@ class NoticeDialog : public XamDialog {
       ImGui::TextWrapped("%s", text_.c_str());
       ImGui::Spacing();
       ImGui::Separator();
-      if (ImGui::Button("OK") || ImGui::IsKeyPressed(ImGuiKey_Enter) ||
-          ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+      pad_.Poll();
+      if (FocusButton("OK", true) || pad_.confirm || pad_.back) {
         ImGui::CloseCurrentPopup();
         Close();
       }

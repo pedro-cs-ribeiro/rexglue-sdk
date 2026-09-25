@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <cstring>
+#include <mutex>
+
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -36,6 +40,67 @@ constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+}
+
+namespace {
+// While a XAM dialog is up the title sees a neutral pad, as on the console.
+// Buttons still held when the dialog closes stay hidden until released, so
+// the press that confirmed the dialog does not also reach the title.
+std::mutex g_ui_mask_mutex;
+uint16_t g_ui_masked_buttons[4] = {};
+// Keystrokes are dropped until then: a dialog closes on the press itself,
+// and its key-down event must not reach the title's menus afterwards.
+std::chrono::steady_clock::time_point g_keystrokes_quiet_until;
+
+bool KeystrokesMuted() {
+  std::lock_guard<std::mutex> lock(g_ui_mask_mutex);
+  return xeXamIsUIActive() || std::chrono::steady_clock::now() < g_keystrokes_quiet_until;
+}
+
+void MaskInputForUI(uint32_t user_index, X_INPUT_STATE* state) {
+  if (user_index >= 4) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_ui_mask_mutex);
+  const uint16_t held = state->gamepad.buttons;
+  uint16_t& masked = g_ui_masked_buttons[user_index];
+  if (xeXamIsUIActive()) {
+    masked |= held;
+    std::memset(&state->gamepad, 0, sizeof(state->gamepad));
+    return;
+  }
+  masked &= held;
+  state->gamepad.buttons = held & ~masked;
+}
+}  // namespace
+
+// Called as a dialog closes: whatever is held then (the press that closed
+// it) stays hidden from the title until released.
+void XamHoldButtonsAfterUI() {
+  auto* is = input_system();
+  uint16_t held[4] = {};
+  for (uint32_t user = 0; user < 4; ++user) {
+    X_INPUT_STATE state = {};
+    if (is && is->GetState(user, &state) == X_ERROR_SUCCESS) {
+      held[user] = state.gamepad.buttons;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_ui_mask_mutex);
+  for (uint32_t user = 0; user < 4; ++user) {
+    g_ui_masked_buttons[user] |= held[user];
+  }
+  g_keystrokes_quiet_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+}
+
+// The pad as the dialogs see it: unmasked, for the given user.
+bool XamGetPadStateForUI(uint32_t user_index, rex::input::X_INPUT_GAMEPAD* out) {
+  auto* is = input_system();
+  X_INPUT_STATE state = {};
+  if (!is || is->GetState(user_index, &state) != X_ERROR_SUCCESS) {
+    return false;
+  }
+  *out = state.gamepad;
+  return true;
 }
 
 void XamResetInactivity_entry() {
@@ -112,7 +177,11 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  X_RESULT result = is->GetState(actual_user_index, input_state);
+  if (result == X_ERROR_SUCCESS && input_state) {
+    MaskInputForUI(actual_user_index, input_state);
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
@@ -154,7 +223,11 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   }
 
   auto* is = input_system();
-  return is->GetKeystroke(actual_user_index, flags, keystroke);
+  X_RESULT result = is->GetKeystroke(actual_user_index, flags, keystroke);
+  if (XSUCCEEDED(result) && KeystrokesMuted()) {
+    return X_ERROR_EMPTY;
+  }
+  return result;
 }
 
 // Same as non-ex, just takes a pointer to user index.
@@ -177,6 +250,9 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
 
   auto* is = input_system();
   auto result = is->GetKeystroke(user_index, flags, keystroke);
+  if (XSUCCEEDED(result) && KeystrokesMuted()) {
+    return X_ERROR_EMPTY;
+  }
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;
   }
