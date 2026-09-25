@@ -161,11 +161,32 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
     case 0x00058023: {
-      REXKRNL_DEBUG(
-          "CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X}) "
-          "unimplemented",
-          buffer_ptr, buffer_length);
-      return X_E_FAIL;
+      // XInviteGetAcceptedInfo(dwUserIndex, XINVITE_INFO*): argument block like
+      // 0x58020's. XINVITE_INFO = { XUID xuidInvitee; XUID xuidInviter; DWORD
+      // dwTitleID; XSESSION_INFO hostInfo (XNKID, XNADDR, XNKEY); BOOL
+      // fFromGameInvite; } (84 bytes). The title joins the inviter's game by
+      // looking the inviter up on the online server, so the host session
+      // fields stay zero.
+      const uint32_t block = buffer_length;
+      AcceptedInvite invite;
+      if (!block || !GetAcceptedInvite(&invite)) {
+        return X_E_FAIL;
+      }
+      const uint32_t info_ptr = BlockArgPointer(memory_, block, 1);
+      if (!info_ptr) {
+        return X_E_INVALIDARG;
+      }
+      auto* info = memory_->TranslateVirtual<uint8_t*>(info_ptr);
+      std::memset(info, 0, 84);
+      auto* profile = kernel_state_->user_profile();
+      memory::store_and_swap<uint64_t>(info + 0, profile ? profile->online_xuid() : 0);
+      memory::store_and_swap<uint64_t>(info + 8, invite.inviter_xuid);
+      memory::store_and_swap<uint32_t>(info + 16, kernel_state_->title_id());
+      memory::store_and_swap<uint64_t>(info + 20, invite.game_id);  // session id
+      memory::store_and_swap<uint32_t>(info + 80, 1);                // fFromGameInvite
+      REXKRNL_INFO("XInviteGetAcceptedInfo: inviter {:016X} (game {})", invite.inviter_xuid,
+                   invite.game_id);
+      return X_E_SUCCESS;
     }
     case 0x00058046: {
       // Required to be successful for 4D530910 to detect signed-in profile

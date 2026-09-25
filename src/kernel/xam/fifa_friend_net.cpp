@@ -215,7 +215,12 @@ std::vector<InviteInfo> FsrFetchInvites(uint64_t self_xuid) {
     InviteInfo e;
     e.from_id = static_cast<uint32_t>(std::strtoul(line.substr(0, t1).c_str(), nullptr, 10));
     e.from_name = line.substr(t1 + 1, t2 - t1 - 1);
+    // "<from_id>\t<from_name>\t<game_id>\t<from_xuid_hex>"
+    size_t t3 = line.find('\t', t2 + 1);
     e.game_id = static_cast<uint32_t>(std::strtoul(line.substr(t2 + 1).c_str(), nullptr, 10));
+    if (t3 != std::string::npos) {
+      e.from_xuid = std::strtoull(line.substr(t3 + 1).c_str(), nullptr, 16);
+    }
     out.push_back(std::move(e));
   }
   return out;

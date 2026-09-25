@@ -27,8 +27,22 @@ struct InviteInfo {
   uint32_t from_id = 0;   // inviter's server-side player id
   std::string from_name;  // inviter's gamertag
   uint32_t game_id = 0;   // host's game to join (0 = none open yet)
+  uint64_t from_xuid = 0; // inviter's online xuid
   std::string notice;     // set instead for a notice from the server
 };
+
+// The invite the user accepted last, as XInviteGetAcceptedInfo reports it.
+struct AcceptedInvite {
+  uint64_t inviter_xuid = 0;
+  uint32_t game_id = 0;
+};
+
+// Records an accepted invite and raises XN_LIVE_INVITE_ACCEPTED, which makes
+// the title fetch it (XInviteGetAcceptedInfo) and join the inviter's game.
+void AcceptGameInvite(const AcceptedInvite& invite);
+
+// The accepted invite, if any.
+bool GetAcceptedInvite(AcceptedInvite* out);
 
 // GET /fsr/players: everyone online except `self_xuid`. Empty on any failure.
 std::vector<FriendEntry> FsrFetchPlayers(uint64_t self_xuid);
@@ -49,7 +63,7 @@ void FsrSendInvite(uint64_t from_xuid, uint32_t to_id);
 // request also carries the console's country).
 std::vector<InviteInfo> FsrFetchInvites(uint64_t self_xuid);
 
-// POST /fsr/accept: accept the invite from `from_id` and join that game.
+// POST /fsr/accept: tell the server the invite from `from_id` was accepted.
 void FsrAccept(uint64_t self_xuid, uint32_t from_id);
 
 // Start the background thread that watches for received invites and prompts the

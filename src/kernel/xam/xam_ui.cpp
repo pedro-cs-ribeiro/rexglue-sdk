@@ -827,8 +827,39 @@ class NoticeDialog : public XamDialog {
 
  private:
   bool has_opened_ = false;
+  PadNav pad_;
   std::string text_;
 };
+
+namespace {
+std::mutex g_accepted_mutex;
+AcceptedInvite g_accepted_invite;
+bool g_has_accepted_invite = false;
+}  // namespace
+
+// XN_LIVE_INVITE_ACCEPTED: the title's network layer (DirtySDK NetConn) polls
+// for it and then calls XInviteGetAcceptedInfo for the user index it carries.
+constexpr uint32_t kNotificationLiveInviteAccepted = 0x02000002;
+
+void AcceptGameInvite(const AcceptedInvite& invite) {
+  {
+    std::lock_guard<std::mutex> lock(g_accepted_mutex);
+    g_accepted_invite = invite;
+    g_has_accepted_invite = true;
+  }
+  REXKRNL_INFO("game invite accepted: inviter {:016X}, raising XN_LIVE_INVITE_ACCEPTED",
+               invite.inviter_xuid);
+  REX_KERNEL_STATE()->BroadcastNotification(kNotificationLiveInviteAccepted, 0);
+}
+
+bool GetAcceptedInvite(AcceptedInvite* out) {
+  std::lock_guard<std::mutex> lock(g_accepted_mutex);
+  if (!g_has_accepted_invite) {
+    return false;
+  }
+  *out = g_accepted_invite;
+  return true;
+}
 
 namespace {
 
@@ -874,6 +905,7 @@ void InvitePollLoop() {
       if (accepted) {
         REXKRNL_INFO("accepted invite from {}", inv.from_name);
         FsrAccept(self_xuid, inv.from_id);
+        AcceptGameInvite({inv.from_xuid, inv.game_id});
       }
     }
   }
