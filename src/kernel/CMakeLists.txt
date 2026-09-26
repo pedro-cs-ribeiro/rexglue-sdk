@@ -19,6 +19,7 @@ set(REXKERNEL_SOURCES
     xam/xam_party.cpp
     xam/xam_task.cpp
     xam/xam_ui.cpp
+    xam/xam_dialog_theme.cpp
     xam/xam_user.cpp
     xam/xam_video.cpp
     xam/xam_voice.cpp

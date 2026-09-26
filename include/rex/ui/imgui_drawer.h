@@ -31,6 +31,10 @@ namespace ui {
 class ImGuiDialog;
 class Window;
 
+// A font the drawer loaded for the runtime's own prompts, by name ("rex-heading",
+// "rex-body", "rex-label"), from the current ImGui context; nullptr if missing.
+ImFont* FindUIFont(const char* name);
+
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   using FontSetupCallback = std::function<void(ImFontAtlas*)>;

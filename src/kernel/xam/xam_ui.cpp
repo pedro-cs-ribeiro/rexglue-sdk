@@ -37,6 +37,7 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/windowed_app_context.h>
 
 #include "fifa_friends.h"
+#include "xam_dialog_theme.h"
 
 namespace rex {
 namespace kernel {
@@ -274,18 +275,6 @@ class PadNav {
   bool primed_ = false;
 };
 
-// A button drawn highlighted when it has the controller's focus.
-bool FocusButton(const char* label, bool focused) {
-  if (focused) {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.72f, 0.07f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-  }
-  const bool clicked = ImGui::Button(label);
-  if (focused) {
-    ImGui::PopStyleColor(2);
-  }
-  return clicked;
-}
 
 class MessageBoxDialog : public XamDialog {
  public:
@@ -305,46 +294,37 @@ class MessageBoxDialog : public XamDialog {
   uint32_t chosen_button() const { return chosen_button_; }
 
   void OnDraw(ImGuiIO& io) override {
-    bool first_draw = false;
-    if (!has_opened_) {
-      ImGui::OpenPopup(title_.c_str());
-      has_opened_ = true;
-      first_draw = true;
+    if (appeared_at_ < 0.0) {
+      appeared_at_ = ImGui::GetTime();
+      focus_ = default_button_ < buttons_.size() ? default_button_ : 0;
     }
-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      if (description_.size()) {
-        ImGui::Text("%s", description_.c_str());
-      }
-      if (first_draw) {
-        ImGui::SetKeyboardFocusHere();
-        focus_ = default_button_ < buttons_.size() ? default_button_ : 0;
-      }
-      pad_.Poll();
-      const size_t count = buttons_.size();
-      if (count) {
-        if (pad_.left || pad_.up) focus_ = (focus_ + count - 1) % count;
-        if (pad_.right || pad_.down) focus_ = (focus_ + 1) % count;
-      }
-      for (size_t i = 0; i < count; ++i) {
-        const bool pad_pick = (pad_.confirm && focus_ == i) || (pad_.back && i == count - 1);
-        if (FocusButton(buttons_[i].c_str(), focus_ == i) || pad_pick) {
-          chosen_button_ = static_cast<uint32_t>(i);
-          ImGui::CloseCurrentPopup();
-          Close();
-          break;
-        }
-        ImGui::SameLine();
-      }
-      ImGui::Spacing();
-      ImGui::Spacing();
-      ImGui::EndPopup();
-    } else {
+    pad_.Poll();
+    const size_t count = buttons_.size();
+    if (count) {
+      if (pad_.left || pad_.up) focus_ = (focus_ + count - 1) % count;
+      if (pad_.right || pad_.down) focus_ = (focus_ + 1) % count;
+    }
+    theme::Panel panel(title_.c_str(), "Message", 820.0f, appeared_at_);
+    if (description_.size()) {
+      panel.Text(description_.c_str());
+      panel.Space(8.0f);
+    }
+    int picked = -1;
+    for (size_t i = 0; i < count; ++i) {
+      if (panel.Bar(buttons_[i].c_str(), focus_ == i)) picked = static_cast<int>(i);
+    }
+    if (panel.hovered() >= 0) focus_ = static_cast<size_t>(panel.hovered());
+    panel.Prompts({{'A', "Select"}, {'B', "Back"}});
+    if (count && pad_.confirm) picked = static_cast<int>(focus_);
+    if (count && pad_.back) picked = static_cast<int>(count - 1);
+    if (picked >= 0 || !count) {
+      chosen_button_ = static_cast<uint32_t>(std::max(picked, 0));
       Close();
     }
   }
 
  private:
-  bool has_opened_ = false;
+  double appeared_at_ = -1.0;
   PadNav pad_;
   size_t focus_ = 0;
   std::string title_;
@@ -457,47 +437,56 @@ class KeyboardInputDialog : public XamDialog {
 
   void OnDraw(ImGuiIO& io) override {
     bool first_draw = false;
-    if (!has_opened_) {
-      ImGui::OpenPopup(title_.c_str());
-      has_opened_ = true;
+    if (appeared_at_ < 0.0) {
+      appeared_at_ = ImGui::GetTime();
       first_draw = true;
     }
-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      if (description_.size()) {
-        ImGui::TextWrapped("%s", description_.c_str());
-      }
-      if (first_draw) {
-        ImGui::SetKeyboardFocusHere();
-      }
-      if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
-                           ImGuiInputTextFlags_EnterReturnsTrue)) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
-        cancelled_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      if (ImGui::Button("OK")) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
-        cancelled_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Cancel")) {
-        text_ = "";
-        cancelled_ = true;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::Spacing();
-      ImGui::EndPopup();
-    } else {
+    pad_.Poll();
+    theme::Panel panel(title_.c_str(), "Enter text", 900.0f, appeared_at_);
+    if (description_.size()) {
+      panel.Text(description_.c_str());
+    }
+    panel.BeginCustom();
+    ImGui::PushFont(rex::ui::FindUIFont("rex-body"), 38.0f * panel.scale());
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(245, 245, 245, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(20, 20, 20, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(16.0f * panel.scale(), 12.0f * panel.scale()));
+    ImGui::SetNextItemWidth(panel.content_width());
+    if (first_draw) {
+      ImGui::SetKeyboardFocusHere();
+    }
+    const bool submit = ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool typing = ImGui::IsItemActive();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    ImGui::PopFont();
+    panel.EndCustom();
+    panel.Space(8.0f);
+    if (pad_.up || pad_.down) ok_focused_ = !ok_focused_;
+    const bool ok = panel.Bar("OK", ok_focused_);
+    const bool cancel = panel.Bar("Cancel", !ok_focused_);
+    if (panel.hovered() >= 0) ok_focused_ = panel.hovered() == 0;
+    panel.Prompts({{'A', "Select"}, {'B', "Cancel"}});
+    // While the text box has focus, Enter/Space/Esc belong to it.
+    const bool pad_ok = !typing && pad_.confirm && ok_focused_;
+    const bool pad_cancel = !typing && ((pad_.confirm && !ok_focused_) || pad_.back);
+    if (submit || ok || pad_ok) {
+      text_ = std::string(text_buffer_.data(), text_buffer_.size());
+      cancelled_ = false;
+      Close();
+    } else if (cancel || pad_cancel) {
+      text_ = "";
+      cancelled_ = true;
       Close();
     }
   }
 
  private:
-  bool has_opened_ = false;
+  double appeared_at_ = -1.0;
+  PadNav pad_;
+  bool ok_focused_ = true;
   std::string title_;
   std::string description_;
   std::string default_text_;
@@ -665,61 +654,48 @@ class FriendPickerDialog : public XamDialog {
   int chosen() const { return chosen_; }
 
   void OnDraw(ImGuiIO& io) override {
-    if (!has_opened_) {
-      ImGui::OpenPopup("Invite a Friend");
-      has_opened_ = true;
+    if (appeared_at_ < 0.0) {
+      appeared_at_ = ImGui::GetTime();
+      selected_ = 0;
     }
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Invite a Friend", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      ImGui::SetWindowFontScale(1.6f);
-      if (friends_.empty()) {
-        ImGui::Text("No friends are online right now.");
-        ImGui::Spacing();
-      } else {
-        // Pre-select the first friend so Invite is immediately actionable
-        // (one click / one confirm) instead of requiring a select-then-invite.
-        if (selected_ < 0 || selected_ >= static_cast<int>(friends_.size())) {
-          selected_ = 0;
-        }
-        pad_.Poll();
-        const int count = static_cast<int>(friends_.size());
-        if (pad_.up) selected_ = (selected_ + count - 1) % count;
-        if (pad_.down) selected_ = (selected_ + 1) % count;
-        ImGui::Text("Select a friend to invite to your game:");
-        ImGui::Separator();
-        for (size_t i = 0; i < friends_.size(); ++i) {
-          if (ImGui::Selectable(friends_[i].name.c_str(), selected_ == static_cast<int>(i))) {
-            selected_ = static_cast<int>(i);
-          }
-        }
-        ImGui::Separator();
-        // A / Enter invites the highlighted friend, like the Invite button.
-        if (FocusButton("Invite", true) || pad_.confirm) {
-          chosen_ = selected_;
-          ImGui::CloseCurrentPopup();
-          Close();
-        }
-        ImGui::SameLine();
-      }
-      if (friends_.empty()) {
-        pad_.Poll();
-      }
-      if (ImGui::Button("Cancel") || pad_.back || (friends_.empty() && pad_.confirm)) {
-        chosen_ = -1;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::EndPopup();
+    pad_.Poll();
+    // Rows: every friend, then Cancel.
+    const int count = static_cast<int>(friends_.size()) + 1;
+    if (pad_.up) selected_ = (selected_ + count - 1) % count;
+    if (pad_.down) selected_ = (selected_ + 1) % count;
+    theme::Panel panel("Invite a friend", "Xbox LIVE", 760.0f, appeared_at_);
+    if (friends_.empty()) {
+      panel.Text("Nobody is online to invite right now.");
     } else {
+      panel.Hint("Choose who to invite to your match.");
+    }
+    panel.Space(6.0f);
+    int clicked = -1;
+    for (size_t i = 0; i < friends_.size(); ++i) {
+      if (panel.Bar(friends_[i].name.c_str(), selected_ == static_cast<int>(i), "Online",
+                    theme::OnlineColor())) {
+        clicked = static_cast<int>(i);
+      }
+    }
+    if (panel.Bar("Cancel", selected_ == count - 1)) clicked = count - 1;
+    if (panel.hovered() >= 0) selected_ = panel.hovered();
+    if (friends_.empty()) {
+      panel.Prompts({{'A', "Back"}});
+    } else {
+      panel.Prompts({{'A', "Invite"}, {'B', "Back"}});
+    }
+    if (pad_.confirm) clicked = selected_;
+    if (pad_.back) clicked = count - 1;
+    if (clicked >= 0) {
+      chosen_ = clicked < count - 1 ? clicked : -1;
       Close();
     }
   }
 
  private:
-  bool has_opened_ = false;
+  double appeared_at_ = -1.0;
   PadNav pad_;
-  int selected_ = -1;
+  int selected_ = 0;
   int chosen_ = -1;
   std::vector<FriendEntry> friends_;
 };
@@ -763,41 +739,33 @@ class InviteReceiveDialog : public XamDialog {
   bool accepted() const { return accepted_; }
 
   void OnDraw(ImGuiIO& io) override {
-    if (!has_opened_) {
-      ImGui::OpenPopup("Game Invite");
-      has_opened_ = true;
+    if (appeared_at_ < 0.0) {
+      appeared_at_ = ImGui::GetTime();
     }
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Game Invite", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      ImGui::SetWindowFontScale(1.6f);
-      ImGui::Text("%s invited you to play.", from_name_.c_str());
-      ImGui::Spacing();
-      ImGui::Separator();
-      pad_.Poll();
-      if (pad_.left || pad_.right || pad_.up || pad_.down) {
-        accept_focused_ = !accept_focused_;
-      }
-      if (FocusButton("Accept", accept_focused_) || (pad_.confirm && accept_focused_)) {
-        accepted_ = true;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::SameLine();
-      if (FocusButton("Decline", !accept_focused_) || (pad_.confirm && !accept_focused_) ||
-          pad_.back) {
-        accepted_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::EndPopup();
-    } else {
+    pad_.Poll();
+    if (pad_.left || pad_.right || pad_.up || pad_.down) {
+      accept_focused_ = !accept_focused_;
+    }
+    theme::Panel panel("Game invite", "Xbox LIVE", 760.0f, appeared_at_);
+    const std::string line = from_name_ + " invited you to play.";
+    panel.Text(line.c_str());
+    panel.Hint("Accepting takes you to their match lobby.");
+    panel.Space(6.0f);
+    const bool accept = panel.Bar("Accept", accept_focused_);
+    const bool decline = panel.Bar("Decline", !accept_focused_);
+    if (panel.hovered() >= 0) accept_focused_ = panel.hovered() == 0;
+    panel.Prompts({{'A', "Select"}, {'B', "Decline"}});
+    if (accept || (pad_.confirm && accept_focused_)) {
+      accepted_ = true;
+      Close();
+    } else if (decline || (pad_.confirm && !accept_focused_) || pad_.back) {
+      accepted_ = false;
       Close();
     }
   }
 
  private:
-  bool has_opened_ = false;
+  double appeared_at_ = -1.0;
   PadNav pad_;
   bool accept_focused_ = true;
   bool accepted_ = false;
@@ -811,31 +779,22 @@ class NoticeDialog : public XamDialog {
       : XamDialog(imgui_drawer), text_(std::move(text)) {}
 
   void OnDraw(ImGuiIO& io) override {
-    if (!has_opened_) {
-      ImGui::OpenPopup("Online");
-      has_opened_ = true;
+    if (appeared_at_ < 0.0) {
+      appeared_at_ = ImGui::GetTime();
     }
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.5f, 0.0f), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Online", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      ImGui::SetWindowFontScale(1.6f);
-      ImGui::TextWrapped("%s", text_.c_str());
-      ImGui::Spacing();
-      ImGui::Separator();
-      pad_.Poll();
-      if (FocusButton("OK", true) || pad_.confirm || pad_.back) {
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::EndPopup();
-    } else {
+    pad_.Poll();
+    theme::Panel panel("Notice", "Xbox LIVE", 820.0f, appeared_at_);
+    panel.Text(text_.c_str());
+    panel.Space(6.0f);
+    const bool ok = panel.Bar("OK", true);
+    panel.Prompts({{'A', "OK"}});
+    if (ok || pad_.confirm || pad_.back) {
       Close();
     }
   }
 
  private:
-  bool has_opened_ = false;
+  double appeared_at_ = -1.0;
   PadNav pad_;
   std::string text_;
 };

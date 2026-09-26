@@ -10,6 +10,7 @@
  */
 
 #include <cfloat>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -194,6 +195,38 @@ void ImGuiDrawer::Initialize() {
                                  io.Fonts->GetGlyphRangesJapanese());
   } else {
     REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
+  }
+#endif
+
+  // Fonts for the runtime's own prompts (friend picker, invites, message
+  // boxes), found by name through FindUIFont. Loaded large and drawn scaled
+  // down, so they stay sharp at any output resolution.
+#if REX_PLATFORM_WIN32
+  struct NamedFont {
+    const char* name;
+    const char* paths[3];
+    float size;
+  };
+  static const NamedFont kUIFonts[] = {
+      {"rex-heading", {"C:/Windows/Fonts/impact.ttf", "C:/Windows/Fonts/seguibl.ttf",
+                       "C:/Windows/Fonts/arialbd.ttf"}, 96.0f},
+      {"rex-body", {"C:/Windows/Fonts/seguisb.ttf", "C:/Windows/Fonts/segoeui.ttf",
+                    "C:/Windows/Fonts/arial.ttf"}, 48.0f},
+      {"rex-label", {"C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf",
+                     nullptr}, 48.0f},
+  };
+  for (const NamedFont& ui_font : kUIFonts) {
+    for (const char* path : ui_font.paths) {
+      if (path && std::filesystem::exists(path)) {
+        ImFontConfig config;
+        std::snprintf(config.Name, sizeof(config.Name), "%s", ui_font.name);
+        config.OversampleH = 2;
+        config.OversampleV = 2;
+        if (io.Fonts->AddFontFromFileTTF(path, ui_font.size, &config, font_glyph_ranges)) {
+          break;
+        }
+      }
+    }
   }
 #endif
 
@@ -701,6 +734,18 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   // which will be persistent until new events actualize individual input
   // properties.
   ClearInput();
+}
+
+ImFont* FindUIFont(const char* name) {
+  if (!ImGui::GetCurrentContext()) {
+    return nullptr;
+  }
+  for (ImFont* font : ImGui::GetIO().Fonts->Fonts) {
+    if (std::strcmp(font->GetDebugName(), name) == 0) {
+      return font;
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace ui
