@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -85,8 +86,57 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(present_dxgi_vblank_wait, false, "UI/Presenter",
+                    "Pace UI ticks with IDXGIOutput::WaitForVBlank instead of a timer at the "
+                    "monitor refresh rate (the DXGI wait busy-spins a core on some drivers)");
+
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+
+#if REX_PLATFORM_WIN32
+// Sleeps until the next refresh of the output's monitor, estimated from its
+// refresh rate. UI ticks only pace redraws (the swap chain does the real vsync),
+// so an estimate is enough, and unlike IDXGIOutput::WaitForVBlank (which spins
+// in the kernel for the whole frame on some NVIDIA drivers) it costs no CPU.
+bool WaitForOutputRefresh(IDXGIOutput* output) {
+  thread_local HANDLE timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  thread_local IDXGIOutput* timed_output = nullptr;
+  thread_local std::chrono::steady_clock::duration period{};
+  thread_local std::chrono::steady_clock::time_point next{};
+  if (!timer) {
+    return SUCCEEDED(output->WaitForVBlank());
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (output != timed_output) {
+    timed_output = output;
+    uint32_t hz = 60;
+    DXGI_OUTPUT_DESC desc;
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (SUCCEEDED(output->GetDesc(&desc)) &&
+        EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) &&
+        mode.dmDisplayFrequency > 1) {
+      hz = mode.dmDisplayFrequency;
+    }
+    period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / hz));
+    next = now;
+  }
+  next += period;
+  if (next < now) {
+    next = now + period;
+  }
+  LARGE_INTEGER due;
+  due.QuadPart =
+      -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(next - now).count() / 100);
+  if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+    return SUCCEEDED(output->WaitForVBlank());
+  }
+  WaitForSingleObject(timer, INFINITE);
+  return true;
+}
+#endif
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
   std::string lowered = effect_name;
@@ -1648,7 +1698,9 @@ void Presenter::DXGIUITickThread() {
     {
       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+      wait_succeeded = REXCVAR_GET(present_dxgi_vblank_wait)
+                           ? SUCCEEDED(dxgi_output->WaitForVBlank())
+                           : WaitForOutputRefresh(dxgi_output.Get());
     }
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {
