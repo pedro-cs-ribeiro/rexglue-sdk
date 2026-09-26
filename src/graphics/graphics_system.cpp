@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/system/gpu_write_signal.h>
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
@@ -314,6 +315,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+  // The guest's interrupt handler may have published GPU progress.
+  system::NotifyGpuMemoryWrite();
 }
 
 void GraphicsSystem::MarkVblank() {

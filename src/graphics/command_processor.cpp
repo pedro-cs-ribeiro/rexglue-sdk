@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
+#include <rex/system/gpu_write_signal.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -373,6 +374,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      system::NotifyGpuMemoryWrite();
     }
   } else {
     switch (index) {
@@ -785,18 +787,22 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_REG_TO_MEM:
       result = ExecutePacketType3_REG_TO_MEM(reader, packet, count);
+      system::NotifyGpuMemoryWrite();
       break;
     case PM4_MEM_WRITE:
       result = ExecutePacketType3_MEM_WRITE(reader, packet, count);
+      system::NotifyGpuMemoryWrite();
       break;
     case PM4_COND_WRITE:
       result = ExecutePacketType3_COND_WRITE(reader, packet, count);
+      system::NotifyGpuMemoryWrite();
       break;
     case PM4_EVENT_WRITE:
       result = ExecutePacketType3_EVENT_WRITE(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_SHD:
       result = ExecutePacketType3_EVENT_WRITE_SHD(reader, packet, count);
+      system::NotifyGpuMemoryWrite();
       break;
     case PM4_EVENT_WRITE_EXT:
       result = ExecutePacketType3_EVENT_WRITE_EXT(reader, packet, count);
