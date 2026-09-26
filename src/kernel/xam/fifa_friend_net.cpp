@@ -82,7 +82,7 @@ std::string HttpRequest(const std::string& method, const std::string& path,
     return {};
   }
   std::ostringstream req;
-  req << method << " " << path << " HTTP/1.0\r\n"
+  req << LiveAuthPreamble() << method << " " << path << " HTTP/1.0\r\n"
       << "Host: " << host << "\r\n"
       << "Content-Type: application/x-www-form-urlencoded\r\n"
       << "Content-Length: " << body.size() << "\r\n"

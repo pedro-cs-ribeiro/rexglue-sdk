@@ -37,6 +37,15 @@ struct AcceptedInvite {
   uint32_t game_id = 0;
 };
 
+// The game token of this run: FSR_LIVE_TOKEN from the environment (the
+// launcher sets it), else the live_token option. Empty when offline.
+const std::string& LiveGameToken();
+
+// The bytes every TCP connection to the online server starts with, and the
+// payload of relay announcements: "FSRA", a length byte, the game token.
+// Empty without a token.
+std::string LiveAuthPreamble();
+
 // Records an accepted invite and raises XN_LIVE_INVITE_ACCEPTED, which makes
 // the title fetch it (XInviteGetAcceptedInfo) and join the inviter's game.
 void AcceptGameInvite(const AcceptedInvite& invite);

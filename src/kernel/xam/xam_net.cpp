@@ -12,8 +12,10 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <random>
 #include <thread>
 #include <utility>
@@ -38,6 +40,8 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+#include "fifa_friends.h"
 
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
@@ -201,6 +205,9 @@ REXCVAR_DEFINE_UINT32(live_service_port, 42124, "Live",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(live_trace, false, "Live", "Log every online-related kernel call")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(live_token, "", "Live",
+                      "Game token for the online server; the launcher passes it in the "
+                      "FSR_LIVE_TOKEN environment variable instead");
 // Diagnostics: report the console as online (title address, link status).
 REXCVAR_DEFINE_UINT32(live_relay_port, 10043, "Live",
                       "UDP port of the server's peer relay for match traffic");
@@ -341,6 +348,30 @@ static uint32_t LiveServerNBO() {
 
 static bool LiveTrace() { return REXCVAR_GET(live_enabled) && REXCVAR_GET(live_trace); }
 
+const std::string& LiveGameToken() {
+  static const std::string token = [] {
+    const char* env = std::getenv("FSR_LIVE_TOKEN");
+    std::string t = env ? env : REXCVAR_GET(live_token);
+    if (t.size() > 255) t.resize(255);
+    return t;
+  }();
+  return token;
+}
+
+std::string LiveAuthPreamble() {
+  const std::string& token = LiveGameToken();
+  if (token.empty()) return {};
+  std::string out = "FSRA";
+  out.push_back(static_cast<char>(token.size()));
+  out += token;
+  return out;
+}
+
+// TCP sockets connected to the online server that still owe the server their
+// preamble; it goes out in front of the title's first send.
+static std::mutex g_preamble_mutex;
+static std::set<uint32_t> g_needs_preamble;
+
 // ---------------------------------------------------------------------------
 // Peer relay. Titles address other consoles by XNADDR and talk to them over
 // secure UDP; here every console carries a 64-bit relay id in its XNADDR
@@ -467,11 +498,14 @@ static bool FromServer(const N_XSOCKADDR_IN& from) {
 // A header-only frame tells the server which endpoint serves this console's
 // port, so peers can reach a socket before it has sent anything itself.
 static void Hello(uint64_t native_handle, uint16_t port) {
-  uint8_t frame[kHeaderSize];
-  WriteHeader(frame, OwnId(), 0, port, 0);
+  // Header plus the game token, which authorises this endpoint on the relay.
+  const std::string auth = LiveAuthPreamble();
+  std::vector<uint8_t> frame(kHeaderSize + auth.size());
+  WriteHeader(frame.data(), OwnId(), 0, port, 0);
+  std::memcpy(frame.data() + kHeaderSize, auth.data(), auth.size());
   const sockaddr_in to = ServerEndpoint();
-  ::sendto(static_cast<SOCKET>(native_handle), reinterpret_cast<const char*>(frame),
-           static_cast<int>(sizeof(frame)), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+  ::sendto(static_cast<SOCKET>(native_handle), reinterpret_cast<const char*>(frame.data()),
+           static_cast<int>(frame.size()), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
 static void RegisterBound(uint64_t native_handle, uint16_t port) {
@@ -1352,6 +1386,10 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
     return -1;
   }
   relay::UnregisterBound(socket->native_handle());
+  {
+    std::lock_guard<std::mutex> lock(g_preamble_mutex);
+    g_needs_preamble.erase(socket_handle);
+  }
 
   // TODO: Absolutely delete this object. It is no longer valid after calling
   // closesocket.
@@ -1476,6 +1514,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
     const uint8_t* ab = reinterpret_cast<const uint8_t*>(&in->sin_addr);
     REXKRNL_INFO("[live] connect sock={} -> {}.{}.{}.{}:{}", socket_handle, ab[0], ab[1], ab[2],
                  ab[3], ntohs(in->sin_port));
+  }
+  if (REXCVAR_GET(live_enabled) && !LiveGameToken().empty()) {
+    const auto* in = reinterpret_cast<const sockaddr_in*>(&native_name);
+    if (in->sin_addr.s_addr == LiveServerNBO()) {
+      std::lock_guard<std::mutex> lock(g_preamble_mutex);
+      g_needs_preamble.insert(socket_handle);
+    }
   }
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
@@ -1830,6 +1875,23 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
+  bool owes_preamble;
+  {
+    std::lock_guard<std::mutex> lock(g_preamble_mutex);
+    owes_preamble = g_needs_preamble.count(socket_handle) != 0;
+  }
+  if (owes_preamble) {
+    // A few dozen bytes on a fresh connection: sent whole or not at all.
+    const std::string preamble = LiveAuthPreamble();
+    const int sent = ::send(static_cast<SOCKET>(socket->native_handle()), preamble.data(),
+                            static_cast<int>(preamble.size()), 0);
+    if (sent != static_cast<int>(preamble.size())) {
+      XThread::SetLastError(0x2733);  // WSAEWOULDBLOCK: the title retries
+      return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_preamble_mutex);
+    g_needs_preamble.erase(socket_handle);
+  }
   const int ret = socket->Send(buf_ptr, buf_len, flags);
   if (LiveTrace()) {
     REXKRNL_INFO("[live] send sock={} len={} -> {}", socket_handle, buf_len, ret);
