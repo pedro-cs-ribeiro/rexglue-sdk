@@ -1002,6 +1002,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // A wait that lasts seconds means the GPU and a guest thread wait on each
+  // other; say what the GPU is waiting for (once per wait).
+  const auto wait_start = std::chrono::steady_clock::now();
+  bool reported = false;
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1043,6 +1047,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!reported && std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(5)) {
+        reported = true;
+        REXGPU_WARN(
+            "WAIT_REG_MEM waiting for 5 s: {} {:#x} func {} ref {:#x} mask {:#x} value {:#x} wait {:#x} "
+            "(ring read {:#x})",
+            is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7, ref, mask, value, wait,
+            reader->read_offset());
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
