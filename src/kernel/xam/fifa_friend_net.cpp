@@ -38,9 +38,12 @@ std::string ConsoleCountryCode() {
   return {static_cast<char>(code[0]), static_cast<char>(code[1])};
 }
 
-// The easw HTTP surface (which also serves the /fsr/ control routes) listens
-// on port 80.
-constexpr uint16_t kControlPort = 80;
+// The easw HTTP surface also serves the /fsr/ control routes; it listens on
+// the same port the title's SportsWorld traffic is sent to (live_http_port).
+uint16_t ControlPort() {
+  const uint32_t port = rex::cvar::Query<uint32_t>("live_http_port");
+  return static_cast<uint16_t>(port ? port : 80);
+}
 
 void EnsureWinsock() {
   static bool started = false;
@@ -67,7 +70,7 @@ std::string HttpRequest(const std::string& method, const std::string& path,
   }
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(kControlPort);
+  addr.sin_port = htons(ControlPort());
   if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
     closesocket(s);
     return {};

@@ -208,6 +208,10 @@ REXCVAR_DEFINE_BOOL(live_trace, false, "Live", "Log every online-related kernel 
 REXCVAR_DEFINE_STRING(live_token, "", "Live",
                       "Game token for the online server; the launcher passes it in the "
                       "FSR_LIVE_TOKEN environment variable instead");
+// The title talks plain HTTP to SportsWorld on port 80. Hosts that already
+// serve a website on 80 keep it; the server serves the same routes on 8306.
+REXCVAR_DEFINE_UINT32(live_http_port, 8306, "Live",
+                      "Port the title's port-80 connections to live_server are sent to");
 // Diagnostics: report the console as online (title address, link status).
 REXCVAR_DEFINE_UINT32(live_relay_port, 10043, "Live",
                       "UDP port of the server's peer relay for match traffic");
@@ -1515,11 +1519,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
     REXKRNL_INFO("[live] connect sock={} -> {}.{}.{}.{}:{}", socket_handle, ab[0], ab[1], ab[2],
                  ab[3], ntohs(in->sin_port));
   }
-  if (REXCVAR_GET(live_enabled) && !LiveGameToken().empty()) {
-    const auto* in = reinterpret_cast<const sockaddr_in*>(&native_name);
+  if (REXCVAR_GET(live_enabled)) {
+    auto* in = reinterpret_cast<sockaddr_in*>(&native_name);
     if (in->sin_addr.s_addr == LiveServerNBO()) {
-      std::lock_guard<std::mutex> lock(g_preamble_mutex);
-      g_needs_preamble.insert(socket_handle);
+      const uint32_t http_port = REXCVAR_GET(live_http_port);
+      if (ntohs(in->sin_port) == 80 && http_port && http_port != 80) {
+        in->sin_port = htons(static_cast<uint16_t>(http_port));
+      }
+      if (!LiveGameToken().empty()) {
+        std::lock_guard<std::mutex> lock(g_preamble_mutex);
+        g_needs_preamble.insert(socket_handle);
+      }
     }
   }
   X_STATUS status = socket->Connect(&native_name, namelen);
